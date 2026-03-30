@@ -35,7 +35,7 @@ class MultiScaleSTFT(nn.Module):
 
     WHY three scales: Multi-scale spectral loss (Adefossé 2022, HiFi-GAN family)
     adds +0.03-0.05 PESQ at near-zero compute. Scale 3 captures plosive bursts (<8ms).
-    Scale 1 resolves harmonics (F0=100Hz → 3.2 bins apart). — D(plan ref)
+    Scale 1 resolves harmonics (F0=100Hz → 3.2 bins apart).
     """
 
     def __init__(self):
