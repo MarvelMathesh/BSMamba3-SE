@@ -15,10 +15,10 @@ class BSMamba3Config:
     
     # ── Model Architecture ──
     d_model: int = 256          # D1: n_heads=4 with headdim=64
-    d_state: int = 16           # D5: complex. Severely reduced to 16 to fit strict <99KB RTX 4050 SMEM limit
+    d_state: int = 16           # D5: must be multiple of 16 (MMA). 32 exceeds RTX 4050 SMEM
     headdim: int = 64           # D1: standard, well-validated
-    mimo_rank: int = 4          # D4: K/R = 8/4 = 2 bands per MIMO unit
-    chunk_size: int = 16        # 64/mimo_rank for bf16
+    mimo_rank: int = 2          # D4: K/R = 8/2 = 4 bands per MIMO unit. Reduced from 4 for larger d_state
+    chunk_size: int = 32        # 64/mimo_rank for bf16
     n_blocks: int = 6           # D2: within 0.37s/step budget
     n_bands: int = 8            # D3: acoustically-motivated
     attn_heads: int = 4         # D7: matching n_heads
@@ -33,7 +33,7 @@ class BSMamba3Config:
     
     # ── Training recipe ──
     batch_size: int = 8
-    epochs: int = 80
+    epochs: int = 200           # SOTA systems train 200+ epochs for convergence
     lr: float = 3e-4
     beta1: float = 0.9
     beta2: float = 0.95          # WHY: SSM params have volatile gradients
@@ -49,7 +49,7 @@ class BSMamba3Config:
     # ── Loss weights ──
     lambda_mag: float = 15.0
     lambda_complex: float = 10.0
-    lambda_sisnr: float = 0.5
+    lambda_sisnr: float = 0.1   # Reduced from 0.5: raw SI-SNR (-17dB) was dominating gradients
     lambda_tc: float = 5.0
     
     # ── PCS ──
@@ -60,8 +60,9 @@ class BSMamba3Config:
     use_remix: bool = True       # +0.03 PESQ
     use_bandmask: bool = True    # SSM regularization
     use_gain_aug: bool = True
-    bandmask_ratio: float = 0.2
+    bandmask_ratio: float = 0.15  # Fraction of freq bins to mask (conservative)
     gain_range_db: float = 6.0
+    ema_decay: float = 0.999      # EMA for evaluation stability (+0.03-0.08 PESQ)
     
     # ── Checkpointing ──
     validate_every: int = 5      # epochs

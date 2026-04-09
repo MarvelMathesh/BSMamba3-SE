@@ -581,9 +581,11 @@ class BandMergeDecoder(nn.Module):
         crm_real = torch.cat(crm_real_parts, dim=-1)  # [B, T, 257]
         crm_imag = torch.cat(crm_imag_parts, dim=-1)  # [B, T, 257]
 
-        # D8: tanh activation bounds CRM in [-1, 1]
-        crm_real = torch.tanh(crm_real)
-        crm_imag = torch.tanh(crm_imag)
+        # Residual CRM: The mask defaults to Identity (real=1, imag=0) at initialization.
+        # Without this, the CRM initializes at 0.0, squashing the signal to silence, and creating
+        # massive, destabilizing loss gradients that trap the network in a vanishing tanh minimum.
+        crm_real = 1.0 + 1.5 * torch.tanh(crm_real)
+        crm_imag = 1.5 * torch.tanh(crm_imag)
 
         return crm_real, crm_imag
 

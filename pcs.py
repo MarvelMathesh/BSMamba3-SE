@@ -162,3 +162,26 @@ class PCSTargetTransform:
         
         # Reconstruct complex with modified magnitude and original phase
         return pcs_mag * torch.exp(1j * phase)
+
+    def get_loss_weights(self) -> torch.Tensor:
+        """
+        Get per-frequency loss weights derived from PCS importance.
+
+        For CRM-based models, PCS should be implemented as frequency-dependent
+        LOSS WEIGHTING, NOT target modification. This avoids the train/eval
+        mismatch where modified targets don't match PESQ evaluation references.
+
+        Higher weight for perceptually important bands (1-4 kHz speech formants).
+        Normalized so mean = 1.0 (no change to total loss magnitude).
+
+        Returns:
+            weights: [n_fft//2 + 1] float32 tensor, mean-normalized
+        """
+        n_bins = self.n_fft // 2 + 1
+        if not self.enabled:
+            return torch.ones(n_bins)
+
+        # Inverse gamma: lower gamma = more important = higher weight
+        weights = 1.0 / np.clip(self.gamma_weights, 0.3, 1.0)
+        weights = weights / weights.mean()  # Normalize to mean=1
+        return torch.from_numpy(weights.astype(np.float32))

@@ -38,6 +38,7 @@ class MultiScaleLoss(nn.Module):
         lambda_tc: float = 5.0,
         stft_scales: Optional[list] = None,
         eps: float = 1e-7,
+        pcs_loss_weights: Optional[torch.Tensor] = None,
     ):
         super().__init__()
         self.lambda_mag = lambda_mag
@@ -60,6 +61,12 @@ class MultiScaleLoss(nn.Module):
         for i, (n_fft, _, win_length) in enumerate(self.stft_scales):
             self.register_buffer(f'loss_window_{i}', torch.hann_window(win_length))
 
+        # PCS frequency-dependent loss weights [F] for primary scale
+        if pcs_loss_weights is not None:
+            self.register_buffer('pcs_weights', pcs_loss_weights)
+        else:
+            self.pcs_weights = None
+
     def _compute_stft(self, x: torch.Tensor, scale_idx: int) -> torch.Tensor:
         """Compute complex STFT for a given scale."""
         n_fft, hop_length, win_length = self.stft_scales[scale_idx]
@@ -72,13 +79,14 @@ class MultiScaleLoss(nn.Module):
 
     def magnitude_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """
-        Multi-scale log-magnitude L1 loss.
+        Multi-scale log-magnitude L1 loss with optional PCS frequency weighting.
 
-        L_mag = (1/3) Σ_{s∈scales} ||log(|STFT_s(ŝ)|+ε) - log(|STFT_s(s)|+ε)||₁
+        L_mag = (1/3) Σ_{s∈scales} ||w(f) · [log(|STFT_s(ŝ)|+ε) - log(|STFT_s(s)|+ε)]||₁
 
         WHY L1 not L2: L1 is robust to outliers (transient frames where magnitude
         can change by 30+ dB in a single frame). L2 would over-penalize these.
         WHY log-magnitude: human perception is approximately logarithmic in amplitude.
+        WHY PCS weighting: emphasize perceptually important bands without modifying targets.
         """
         total_loss = 0.0
         for i in range(len(self.stft_scales)):
@@ -88,29 +96,40 @@ class MultiScaleLoss(nn.Module):
             pred_mag = torch.log(pred_stft.abs() + self.eps)
             tgt_mag = torch.log(tgt_stft.abs() + self.eps)
 
-            total_loss = total_loss + F.l1_loss(pred_mag, tgt_mag)
+            diff = (pred_mag - tgt_mag).abs()  # [B, F, T]
+
+            # Apply PCS frequency weighting on primary scale only
+            if self.pcs_weights is not None and i == 0:
+                w = self.pcs_weights.unsqueeze(0).unsqueeze(-1)  # [1, F, 1]
+                diff = diff * w
+
+            total_loss = total_loss + diff.mean()
 
         return total_loss / len(self.stft_scales)
 
     def complex_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """
-        Complex STFT L1 loss (real and imaginary separately).
+        Complex STFT L1 loss (real and imaginary separately) with PCS weighting.
 
-        L_complex = ||Re(STFT(ŝ)) - Re(STFT(s))||₁ + ||Im(STFT(ŝ)) - Im(STFT(s))||₁
+        L_complex = ||w(f)·[Re(STFT(ŝ)) - Re(STFT(s))]||₁ + ||w(f)·[Im(...)]||₁
 
         WHY: Phase recovery is required for WB-PESQ > 3.0. ITU-T P.862.2
-        weights phase errors increasingly at high PESQ scores. Training directly
-        on complex STFT provides gradients through both magnitude and phase.
-        Reference: MP-SENet parallel mag+phase loss.
+        weights phase errors increasingly at high PESQ scores.
         """
         # Use primary scale only (512-pt STFT)
         pred_stft = self._compute_stft(pred, 0)    # [B, 257, T]
         tgt_stft = self._compute_stft(target, 0)   # [B, 257, T]
 
-        loss_real = F.l1_loss(pred_stft.real, tgt_stft.real)
-        loss_imag = F.l1_loss(pred_stft.imag, tgt_stft.imag)
+        diff_real = (pred_stft.real - tgt_stft.real).abs()
+        diff_imag = (pred_stft.imag - tgt_stft.imag).abs()
 
-        return loss_real + loss_imag
+        # Apply PCS frequency weighting
+        if self.pcs_weights is not None:
+            w = self.pcs_weights.unsqueeze(0).unsqueeze(-1)  # [1, F, 1]
+            diff_real = diff_real * w
+            diff_imag = diff_imag * w
+
+        return diff_real.mean() + diff_imag.mean()
 
     def si_snr_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         """
@@ -144,6 +163,9 @@ class MultiScaleLoss(nn.Module):
             (torch.sum(e_noise ** 2, dim=-1) + self.eps)
             + self.eps
         )  # [B]
+
+        # Clamp to prevent extreme values from dominating gradient flow
+        si_snr = torch.clamp(si_snr, -30.0, 30.0)
 
         return -si_snr.mean()
 

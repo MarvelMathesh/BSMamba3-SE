@@ -44,6 +44,41 @@ from dataset import create_dataloaders
 warnings.filterwarnings('ignore', category=UserWarning)
 
 
+class ModelEMA:
+    """Exponential Moving Average of model parameters for stable evaluation.
+    
+    EMA provides +0.03-0.08 PESQ through variance reduction.
+    Used by SEMamba, MP-SENet, and all SOTA SE systems.
+    """
+    
+    def __init__(self, model, decay=0.999):
+        self.decay = decay
+        self.shadow = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
+    
+    def update(self, model):
+        """Update shadow params with current model params."""
+        for name, param in model.named_parameters():
+            if param.requires_grad and name in self.shadow:
+                self.shadow[name].mul_(self.decay).add_(param.data, alpha=1 - self.decay)
+    
+    def apply(self, model):
+        """Replace model params with shadow (EMA) params for evaluation."""
+        self.backup = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad and name in self.shadow:
+                self.backup[name] = param.data.clone()
+                param.data.copy_(self.shadow[name])
+    
+    def restore(self, model):
+        """Restore original model params after evaluation."""
+        for name, param in model.named_parameters():
+            if param.requires_grad and name in self.backup:
+                param.data.copy_(self.backup[name])
+
+
 def set_seed(seed: int = 42):
     """Set all random seeds for reproducibility. Seed reported in paper."""
     random.seed(seed)
@@ -103,6 +138,7 @@ def train_epoch(
     config: BSMamba3Config,
     pcs_transform=None,
     global_step: int = 0,
+    ema=None,
 ) -> tuple:
     """
     Full training epoch with bf16 autocast, gradient clipping, and step timing.
@@ -124,6 +160,29 @@ def train_epoch(
 
         noisy = noisy.to(device, non_blocking=True)  # [B, L]
         clean = clean.to(device, non_blocking=True)   # [B, L]
+
+        # NOTE: PCS is implemented as frequency-dependent LOSS WEIGHTING
+        # (in MultiScaleLoss), NOT as target waveform modification.
+        # Modifying targets caused catastrophic train/eval mismatch (PESQ→1.50).
+
+        # ═══ BandMask: Random frequency band masking on noisy input ═══
+        if config.use_bandmask and random.random() < 0.2:
+            with torch.no_grad():
+                bm_window = loss_fn.loss_window_0
+                noisy_stft = torch.stft(
+                    noisy, n_fft=512, hop_length=256, win_length=512,
+                    window=bm_window, return_complex=True, center=True,
+                    pad_mode='reflect', normalized=False
+                )
+                n_freq = noisy_stft.shape[1]  # 257
+                n_mask = int(n_freq * config.bandmask_ratio)  # ~38 bins
+                mask_start = random.randint(0, n_freq - n_mask)
+                noisy_stft[:, mask_start:mask_start + n_mask, :] = 0
+                noisy = torch.istft(
+                    noisy_stft, n_fft=512, hop_length=256, win_length=512,
+                    window=bm_window, center=True, length=noisy.shape[-1],
+                    normalized=False
+                )
 
         # Forward pass with bf16 autocast
         with autocast(device_type='cuda', dtype=torch.bfloat16):
@@ -149,6 +208,10 @@ def train_epoch(
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
             global_step += 1
+
+            # EMA update after each optimizer step
+            if ema is not None:
+                ema.update(model)
 
         step_time = time.time() - step_start
         step_times.append(step_time)
@@ -377,15 +440,8 @@ def train(config: BSMamba3Config):
         model, config, steps_per_epoch
     )
     
-    # Create loss function
-    loss_fn = MultiScaleLoss(
-        lambda_mag=config.lambda_mag,
-        lambda_complex=config.lambda_complex,
-        lambda_sisnr=config.lambda_sisnr,
-        lambda_tc=config.lambda_tc,
-    ).to(device)
-    
-    # PCS transform (if enabled)
+    # Compute PCS frequency weights for loss function
+    pcs_loss_weights = None
     pcs_transform = None
     if config.use_pcs:
         pcs_transform = PCSTargetTransform(
@@ -393,7 +449,21 @@ def train(config: BSMamba3Config):
             pcs_gamma=config.pcs_gamma,
             enabled=True,
         )
-        print(f"  [PCS] Enabled with γ={config.pcs_gamma}")
+        pcs_loss_weights = pcs_transform.get_loss_weights()
+        print(f"  [PCS] Frequency-weighted loss with γ={config.pcs_gamma}")
+    
+    # Create loss function with PCS weights
+    loss_fn = MultiScaleLoss(
+        lambda_mag=config.lambda_mag,
+        lambda_complex=config.lambda_complex,
+        lambda_sisnr=config.lambda_sisnr,
+        lambda_tc=config.lambda_tc,
+        pcs_loss_weights=pcs_loss_weights,
+    ).to(device)
+    
+    # EMA for evaluation stability
+    ema = ModelEMA(model, decay=config.ema_decay)
+    print(f"  [EMA] Enabled with decay={config.ema_decay}")
     
     # Training state
     best_pesq = 0.0
@@ -421,6 +491,7 @@ def train(config: BSMamba3Config):
             config=config,
             pcs_transform=pcs_transform,
             global_step=global_step,
+            ema=ema,
         )
         
         epoch_time = time.time() - epoch_start
@@ -456,6 +527,10 @@ def train(config: BSMamba3Config):
         # ═══ VALIDATION ═══
         if epoch % config.validate_every == 0 or epoch == config.epochs:
             print(f"\n  [Validation] Running at epoch {epoch}...")
+            # Apply EMA weights for stable evaluation
+            if ema is not None:
+                ema.apply(model)
+            
             val_results = validate(
                 model=model,
                 val_loader=val_loader,
@@ -463,6 +538,10 @@ def train(config: BSMamba3Config):
                 out_dir=config.out_dir,
                 epoch=epoch,
             )
+            
+            # Restore training weights
+            if ema is not None:
+                ema.restore(model)
             
             if 'wb_pesq_mean' in val_results:
                 pesq_score = val_results['wb_pesq_mean']
@@ -475,6 +554,9 @@ def train(config: BSMamba3Config):
                 # Save best model
                 if pesq_score > best_pesq:
                     best_pesq = pesq_score
+                    # Save with EMA weights for best inference quality
+                    if ema is not None:
+                        ema.apply(model)
                     torch.save({
                         'epoch': epoch,
                         'model_state_dict': model.state_dict(),
@@ -483,6 +565,8 @@ def train(config: BSMamba3Config):
                         'pesq': pesq_score,
                         'config': vars(config),
                     }, os.path.join(config.out_dir, 'checkpoint_best.pt'))
+                    if ema is not None:
+                        ema.restore(model)
                     print(f"  ★ New best PESQ: {pesq_score:.4f} — checkpoint saved!")
                 
                 epoch_log.update(val_results)
@@ -523,15 +607,15 @@ def main():
     parser.add_argument('--d_model', type=int, default=256)
     parser.add_argument('--d_state', type=int, default=16)
     parser.add_argument('--headdim', type=int, default=64)
-    parser.add_argument('--mimo_rank', type=int, default=4)
-    parser.add_argument('--chunk_size', type=int, default=16)
+    parser.add_argument('--mimo_rank', type=int, default=2)
+    parser.add_argument('--chunk_size', type=int, default=32)
     parser.add_argument('--n_blocks', type=int, default=6)
     parser.add_argument('--k_bands', type=int, default=8)
     
     # Training
     parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--segment_len', type=float, default=4.0)
-    parser.add_argument('--epochs', type=int, default=80)
+    parser.add_argument('--epochs', type=int, default=200)
     parser.add_argument('--lr', type=float, default=3e-4)
     parser.add_argument('--weight_decay', type=float, default=0.01)
     parser.add_argument('--grad_clip', type=float, default=1.0)
