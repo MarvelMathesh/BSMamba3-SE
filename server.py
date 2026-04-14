@@ -1,82 +1,103 @@
+"""
+BSMamba3-SE FastAPI Server
+══════════════════════════
+REST API for real-time speech enhancement.
+POST /enhance with audio file → returns enhanced audio.
+"""
+
+import io
 import os
-import time
-import tempfile
-import uvicorn
-from fastapi import FastAPI, UploadFile, File, BackgroundTasks
-from fastapi.responses import FileResponse
+import torch
+import numpy as np
+import soundfile as sf
+from fastapi import FastAPI, UploadFile, File
+from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
-from inference import load_model, enhance_file
+from contextlib import asynccontextmanager
 
-app = FastAPI(title="BSMamba3-SE Speech Enhancement API")
+from inference import BSMamba3Enhancer
 
-# Enable CORS for Next.js app
+
+# Global enhancer instance
+enhancer = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Load model on startup."""
+    global enhancer
+    ckpt_path = os.environ.get(
+        'BSMAMBA3_CHECKPOINT',
+        './checkpoints/bsmamba3/checkpoint_best.pt'
+    )
+    device = os.environ.get('BSMAMBA3_DEVICE', 'cuda')
+    print(f"[Server] Loading model from {ckpt_path}")
+    enhancer = BSMamba3Enhancer(ckpt_path, device)
+    print("[Server] Model loaded and ready")
+    yield
+    print("[Server] Shutting down")
+
+
+app = FastAPI(
+    title="BSMamba3-SE Speech Enhancement API",
+    description="Upload noisy audio, get enhanced audio back.",
+    lifespan=lifespan,
+)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Adjust this in production
-    allow_credentials=True,
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Global variables to hold model
-global_model = None
-global_config = None
-global_device = None
 
-@app.on_event("startup")
-def startup_event():
-    global global_model, global_config, global_device
-    print("[Server] Loading BSMamba3-SE model into GPU memory...")
-    checkpoint_path = "./checkpoints/bsmamba3_run1/checkpoint_epoch75.pt"
-    if not os.path.exists(checkpoint_path):
-        print(f"[Error] Checkpoint not found at {checkpoint_path}")
-        return
-        
-    global_model, global_config, global_device = load_model(checkpoint_path, "cuda")
-    print(f"[Server] Model loaded successfully: {global_model.count_parameters()/1e6:.2f}M params")
+@app.post("/enhance")
+async def enhance_audio(file: UploadFile = File(...)):
+    """
+    Enhance a noisy audio file.
+    
+    Accepts: WAV, FLAC, or any soundfile-supported format.
+    Returns: Enhanced WAV audio (16kHz, mono, float32).
+    """
+    # Read uploaded audio
+    audio_bytes = await file.read()
+    audio_data, sr = sf.read(io.BytesIO(audio_bytes), dtype='float32')
 
-def cleanup_files(*filepaths):
-    """Background task to remove temp files after they've been sent."""
-    time.sleep(1)  # small buffer so FileResponse completes
-    for fp in filepaths:
-        try:
-            if os.path.exists(fp):
-                os.remove(fp)
-        except Exception as e:
-            print(f"Error cleaning up {fp}: {e}")
+    # Resample if needed
+    if sr != 16000:
+        import librosa
+        audio_data = librosa.resample(audio_data, orig_sr=sr, target_sr=16000)
 
-@app.post("/api/enhance")
-async def enhance_audio(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
-    """Receives an audio file, runs inference, and returns enhanced audio."""
-    if not global_model:
-        return {"error": "Model not loaded properly."}
-        
-    try:
-        # Save uploaded file to temp directory
-        fd_input, input_path = tempfile.mkstemp(suffix=".wav")
-        with os.fdopen(fd_input, 'wb') as f:
-            f.write(await file.read())
-            
-        fd_output, output_path = tempfile.mkstemp(suffix="_enhanced.wav")
-        os.close(fd_output)
-        
-        # Run BSMamba3-SE inference
-        print(f"[API] Processing {file.filename}...")
-        result = enhance_file(global_model, input_path, output_path, global_device, sr=16000)
-        
-        # Cleanup files dynamically after they are returned to client!
-        background_tasks.add_task(cleanup_files, input_path, output_path)
-        
-        return FileResponse(
-            path=output_path, 
-            media_type="audio/wav", 
-            filename=f"enhanced_{file.filename}"
-        )
-        
-    except Exception as e:
-        print(f"[API] Error: {e}")
-        return {"error": str(e)}
+    # Mono conversion
+    if audio_data.ndim > 1:
+        audio_data = audio_data.mean(axis=1)
+
+    # Enhance
+    enhanced = enhancer.enhance(audio_data)
+
+    # Write to bytes
+    output_buffer = io.BytesIO()
+    sf.write(output_buffer, enhanced, 16000, format='WAV', subtype='FLOAT')
+    output_buffer.seek(0)
+
+    return Response(
+        content=output_buffer.read(),
+        media_type="audio/wav",
+        headers={"Content-Disposition": f"attachment; filename=enhanced_{file.filename}"},
+    )
+
+
+@app.get("/health")
+async def health():
+    """Health check endpoint."""
+    return {
+        "status": "ok",
+        "model_loaded": enhancer is not None,
+        "params": enhancer.model.count_parameters() if enhancer else 0,
+    }
+
 
 if __name__ == "__main__":
-    print("[Server] Starting uvicorn...")
-    uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=True)
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

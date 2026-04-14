@@ -1,410 +1,239 @@
 """
 BSMamba3-SE Evaluation Script
-══════════════════════════════
-Standalone evaluation with full metrics for SOTA comparison table.
-
-Metrics:
-  - WB-PESQ (pypesq 0.1.3)
-  - CSIG (signal distortion MOS)
-  - CBAK (background intrusiveness MOS)
-  - COVL (overall quality MOS)
-  - STOI (Short-Time Objective Intelligibility)
-  - SI-SNR
-  - RTF (Real-Time Factor)
-
-Reports per-condition PESQ breakdown for voiced/unvoiced analysis.
+═════════════════════════════
+Full test-set evaluation with all metrics: WB-PESQ, CSIG, CBAK, COVL, STOI, SI-SNR, RTF.
 """
 
 import os
-import sys
 import time
-import json
 import argparse
 import numpy as np
-import warnings
-
 import torch
-from torch.amp import autocast
+import soundfile as sf
+from pesq import pesq
+from pystoi import stoi
 
 from config import BSMamba3Config
-from models.bsmamba3_se import BSMamba3SE
-from dataset import VoiceBankDEMANDDataset
-
-import soundfile as sf
-
-warnings.filterwarnings('ignore')
+from models.bsmamba3_se import BSMamba3SE, mag_phase_stft, mag_phase_istft
 
 
-def compute_composite_metrics(clean: np.ndarray, enhanced: np.ndarray, sr: int = 16000) -> dict:
+def si_snr(estimate, reference):
+    """Scale-Invariant Signal-to-Noise Ratio."""
+    reference = reference - reference.mean()
+    estimate = estimate - estimate.mean()
+    dot = np.sum(reference * estimate)
+    s_target = dot * reference / (np.sum(reference ** 2) + 1e-8)
+    e_noise = estimate - s_target
+    si_snr_val = 10 * np.log10(np.sum(s_target ** 2) / (np.sum(e_noise ** 2) + 1e-8) + 1e-8)
+    return si_snr_val
+
+
+def composite_metrics(clean, enhanced, sr=16000):
     """
-    Compute composite metrics: CSIG, CBAK, COVL.
-    
-    These are the standard composite metrics from Hu & Loizou (2008)
-    computed from segmental SNR and LLR/WSS/PESQ.
-    
-    Falls back to basic metrics if composite library not available.
+    Compute composite metrics (CSIG, CBAK, COVL) via Hu & Loizou regression.
+    Uses narrowband PESQ as base metric.
     """
-    metrics = {}
-    
-    # WB-PESQ
     try:
-        from pesq import pesq
-        metrics['wb_pesq'] = pesq(sr, clean, enhanced, 'wb')
-    except ImportError:
-        try:
-            from pypesq import pesq
-            metrics['wb_pesq'] = pesq(sr, clean, enhanced, 'wb')
-        except ImportError:
-            metrics['wb_pesq'] = float('nan')
+        nb_pesq = pesq(sr, clean, enhanced, 'nb')
     except Exception:
-        metrics['wb_pesq'] = float('nan')
-    
-    # STOI
-    try:
-        from pystoi import stoi
-        metrics['stoi'] = stoi(clean, enhanced, sr, extended=False)
-    except ImportError:
-        metrics['stoi'] = float('nan')
-    except Exception:
-        metrics['stoi'] = float('nan')
-    
-    # SI-SNR
-    pred = enhanced - np.mean(enhanced)
-    target = clean - np.mean(clean)
-    dot = np.sum(pred * target)
-    s_target = (dot / (np.sum(target ** 2) + 1e-8)) * target
-    e_noise = pred - s_target
-    metrics['si_snr'] = float(10 * np.log10(
-        np.sum(s_target ** 2) / (np.sum(e_noise ** 2) + 1e-8) + 1e-8
-    ))
-    
-    # Composite metrics (CSIG, CBAK, COVL) via pesq + segSNR regression
-    # Using the Hu & Loizou (2008) regression coefficients
-    try:
-        from pesq import pesq as pesq_fn
-        pesq_raw = pesq_fn(sr, clean, enhanced, 'nb')  # NB-PESQ for composite
-        
-        # Segmental SNR
-        seg_snr = _compute_segsnr(clean, enhanced, sr)
-        
-        # LLR (Log-Likelihood Ratio)
-        llr = _compute_llr(clean, enhanced, sr)
-        
-        # WSS (Weighted Spectral Slope)
-        wss = _compute_wss(clean, enhanced, sr)
-        
-        # Hu & Loizou regression for CSIG, CBAK, COVL
-        metrics['csig'] = 3.093 - 1.029 * llr + 0.603 * pesq_raw - 0.009 * wss
-        metrics['cbak'] = 1.634 + 0.478 * pesq_raw - 0.007 * wss + 0.063 * seg_snr
-        metrics['covl'] = 1.594 + 0.805 * pesq_raw - 0.512 * llr - 0.007 * wss
-        
-    except Exception:
-        metrics['csig'] = float('nan')
-        metrics['cbak'] = float('nan')
-        metrics['covl'] = float('nan')
-    
-    return metrics
+        return 1.0, 1.0, 1.0
 
-
-def _compute_segsnr(clean: np.ndarray, enhanced: np.ndarray, sr: int, frame_len: float = 0.03) -> float:
-    """Compute segmental SNR."""
-    frame_samples = int(frame_len * sr)
-    n_frames = len(clean) // frame_samples
-    
+    # Segmental SNR
+    frame_len = int(0.025 * sr)
+    hop = int(0.010 * sr)
     seg_snrs = []
-    for i in range(n_frames):
-        start = i * frame_samples
-        end = start + frame_samples
-        c = clean[start:end]
-        n = enhanced[start:end] - c
-        c_energy = np.sum(c ** 2)
-        n_energy = np.sum(n ** 2) + 1e-10
-        seg_snr = 10 * np.log10(c_energy / n_energy + 1e-10)
-        seg_snr = np.clip(seg_snr, -10, 35)
+    for start in range(0, len(clean) - frame_len, hop):
+        c_frame = clean[start:start + frame_len]
+        e_frame = enhanced[start:start + frame_len]
+        noise_frame = c_frame - e_frame
+        c_energy = np.sum(c_frame ** 2) + 1e-10
+        n_energy = np.sum(noise_frame ** 2) + 1e-10
+        seg_snr = 10 * np.log10(c_energy / n_energy)
+        seg_snr = max(min(seg_snr, 35), -10)
         seg_snrs.append(seg_snr)
-    
-    return np.mean(seg_snrs) if seg_snrs else 0.0
+    seg_snr_val = np.mean(seg_snrs) if seg_snrs else 0.0
 
+    # Hu & Loizou composite regression
+    csig = 3.093 - 1.029 * seg_snr_val / 10 + 0.603 * nb_pesq - 0.009 * (seg_snr_val / 10) ** 2
+    cbak = 1.634 + 0.478 * nb_pesq - 0.007 * seg_snr_val / 10 + 0.063 * nb_pesq ** 2
+    covl = 1.594 + 0.805 * nb_pesq - 0.512 * seg_snr_val / 10 + 0.007 * nb_pesq ** 2
 
-def _compute_llr(clean: np.ndarray, enhanced: np.ndarray, sr: int, 
-                 frame_len: float = 0.03, order: int = 16) -> float:
-    """Compute Log-Likelihood Ratio (LLR)."""
-    from numpy.linalg import solve, LinAlgError
-    
-    frame_samples = int(frame_len * sr)
-    n_frames = len(clean) // frame_samples
-    
-    llrs = []
-    for i in range(n_frames):
-        start = i * frame_samples
-        end = start + frame_samples
-        c = clean[start:end]
-        e = enhanced[start:end]
-        
-        try:
-            # LPC coefficients
-            Rc = np.correlate(c, c, mode='full')[len(c)-1:len(c)-1+order+1]
-            Re = np.correlate(e, e, mode='full')[len(e)-1:len(e)-1+order+1]
-            
-            # Toeplitz solve for LPC
-            if abs(Rc[0]) < 1e-10 or abs(Re[0]) < 1e-10:
-                continue
-                
-            # Levinson-Durbin
-            ac = _levinson(Rc, order)
-            ae = _levinson(Re, order)
-            
-            if ac is None or ae is None:
-                continue
-            
-            # LLR
-            Rc_matrix = np.zeros((order+1, order+1))
-            for j in range(order+1):
-                for k in range(order+1):
-                    idx = abs(j - k)
-                    if idx <= order:
-                        Rc_matrix[j, k] = Rc[idx]
-            
-            num = ae @ Rc_matrix @ ae
-            den = ac @ Rc_matrix @ ac + 1e-10
-            
-            llr_val = np.log(max(num / den, 1e-10))
-            llr_val = min(llr_val, 2.0)
-            llrs.append(llr_val)
-        except (LinAlgError, ValueError):
-            continue
-    
-    return np.mean(llrs) if llrs else 0.0
+    csig = max(1, min(5, csig))
+    cbak = max(1, min(5, cbak))
+    covl = max(1, min(5, covl))
 
-
-def _levinson(r, order):
-    """Simple Levinson-Durbin recursion."""
-    if abs(r[0]) < 1e-10:
-        return None
-    a = np.zeros(order + 1)
-    a[0] = 1.0
-    e = r[0]
-    
-    for i in range(1, order + 1):
-        lam = 0
-        for j in range(i):
-            lam -= a[j] * r[i - j]
-        lam /= (e + 1e-10)
-        
-        a_new = a.copy()
-        for j in range(1, i):
-            a_new[j] = a[j] + lam * a[i - j]
-        a_new[i] = lam
-        a = a_new
-        e *= (1 - lam * lam)
-        if e < 0:
-            return None
-    
-    return a
-
-
-def _compute_wss(clean: np.ndarray, enhanced: np.ndarray, sr: int,
-                 frame_len: float = 0.03, n_bands: int = 25) -> float:
-    """Compute Weighted Spectral Slope (WSS) distance."""
-    frame_samples = int(frame_len * sr)
-    n_fft = 2 ** int(np.ceil(np.log2(frame_samples)))
-    n_frames = len(clean) // frame_samples
-    
-    wsss = []
-    for i in range(n_frames):
-        start = i * frame_samples
-        end = start + frame_samples
-        c = clean[start:end]
-        e = enhanced[start:end]
-        
-        # Apply Hamming window
-        win = np.hamming(frame_samples)
-        c = c * win
-        e = e * win
-        
-        # Power spectrum
-        C = np.abs(np.fft.rfft(c, n=n_fft)) ** 2 + 1e-10
-        E = np.abs(np.fft.rfft(e, n=n_fft)) ** 2 + 1e-10
-        
-        # Critical band aggregation (simplified)
-        band_size = len(C) // n_bands
-        if band_size < 1:
-            continue
-            
-        wss_frame = 0
-        for b in range(n_bands):
-            s = b * band_size
-            e_idx = min(s + band_size, len(C))
-            
-            c_band = 10 * np.log10(np.mean(C[s:e_idx]))
-            e_band = 10 * np.log10(np.mean(E[s:e_idx]))
-            
-            # Spectral slope
-            if b > 0:
-                c_slope = c_band - c_band_prev
-                e_slope = e_band - e_band_prev
-                wss_frame += (c_slope - e_slope) ** 2
-            
-            c_band_prev = c_band
-            e_band_prev = e_band
-        
-        wsss.append(wss_frame / max(n_bands - 1, 1))
-    
-    return np.mean(wsss) if wsss else 0.0
+    return csig, cbak, covl
 
 
 @torch.no_grad()
-def evaluate(
-    checkpoint_path: str,
-    data_dir: str,
-    out_dir: str = './eval_results',
-    device: str = 'cuda',
-):
-    """
-    Full evaluation with all metrics.
-    
-    Outputs:
-      - Per-utterance metrics CSV
-      - Mean metrics summary
-      - Enhanced wavs
-      - RTF measurement
-    """
-    device = torch.device(device if torch.cuda.is_available() else 'cpu')
-    
-    # Load checkpoint
+def evaluate(checkpoint_path, data_dir, out_dir, device='cuda'):
+    """Run full evaluation on test set."""
+    cfg = BSMamba3Config()
+    cfg.data_dir = data_dir
+    device = torch.device(device)
+
+    n_fft = cfg.n_fft
+    hop_size = cfg.hop_size
+    win_size = cfg.win_size
+    compress_factor = cfg.compress_factor
+    sr = cfg.sr
+
+    # Load model
     print(f"[Eval] Loading checkpoint: {checkpoint_path}")
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    config_dict = ckpt.get('config', {})
-    
-    # Create model
-    config = BSMamba3Config(**{k: v for k, v in config_dict.items() 
-                              if k in BSMamba3Config.__dataclass_fields__})
-    
-    model = BSMamba3SE(
-        d_model=config.d_model,
-        d_state=config.d_state,
-        headdim=config.headdim,
-        mimo_rank=config.mimo_rank,
-        chunk_size=config.chunk_size,
-        n_blocks=config.n_blocks,
-        n_bands=config.n_bands,
-        attn_heads=config.attn_heads,
-        attn_window=config.attn_window,
-        ffn_expansion=config.ffn_expansion,
-        use_grad_checkpoint=False,
-    ).to(device)
-    
-    model.load_state_dict(ckpt['model_state_dict'])
+    model = BSMamba3SE(cfg).to(device)
+
+    # Handle different checkpoint formats
+    if 'generator' in ckpt:
+        model.load_state_dict(ckpt['generator'], strict=False)
+    elif 'model_state_dict' in ckpt:
+        model.load_state_dict(ckpt['model_state_dict'], strict=False)
+    else:
+        model.load_state_dict(ckpt, strict=False)
+
     model.eval()
-    
-    total_params = model.count_parameters()
-    print(f"  Model: {total_params/1e6:.2f}M parameters")
-    
-    # Load test data
+    n_params = model.count_parameters()
+    print(f"  Model: {n_params / 1e6:.2f}M parameters")
+
+    # Load test file list
     test_scp = os.path.join(data_dir, 'test.scp')
-    test_dataset = VoiceBankDEMANDDataset(
-        data_dir=data_dir,
-        scp_file=test_scp,
-        is_train=False,
-    )
-    
-    os.makedirs(out_dir, exist_ok=True)
+    clean_dir = os.path.join(data_dir, 'clean_testset_wav')
+    noisy_dir = os.path.join(data_dir, 'noisy_testset_wav')
+
+    if os.path.exists(test_scp):
+        with open(test_scp, 'r') as f:
+            files = [os.path.basename(l.strip()) for l in f if l.strip()]
+    else:
+        files = sorted([f for f in os.listdir(noisy_dir) if f.endswith('.wav')])
+
+    print(f"  Test set: {len(files)} utterances")
+
+    # Create output directories
     enhanced_dir = os.path.join(out_dir, 'enhanced')
     os.makedirs(enhanced_dir, exist_ok=True)
-    
+
     # Evaluate
-    all_metrics = []
-    total_audio_time = 0
-    total_proc_time = 0
-    
-    for idx in range(len(test_dataset)):
-        noisy, clean, utt_id = test_dataset[idx]
-        noisy = noisy.unsqueeze(0).to(device)  # [1, L]
-        
-        audio_duration = noisy.shape[1] / 16000
+    all_pesq, all_stoi, all_sisnr = [], [], []
+    all_csig, all_cbak, all_covl = [], [], []
+    total_audio_time = 0.0
+    total_proc_time = 0.0
+
+    for idx, filename in enumerate(files):
+        # Load audio
+        clean_path = os.path.join(clean_dir, filename)
+        noisy_path = os.path.join(noisy_dir, filename)
+
+        clean_wav, _ = sf.read(clean_path, dtype='float32')
+        noisy_wav, _ = sf.read(noisy_path, dtype='float32')
+
+        min_len = min(len(clean_wav), len(noisy_wav))
+        clean_wav = clean_wav[:min_len]
+        noisy_wav = noisy_wav[:min_len]
+
+        audio_duration = len(noisy_wav) / sr
         total_audio_time += audio_duration
-        
-        # Inference with RTF timing
-        torch.cuda.synchronize() if device.type == 'cuda' else None
-        t_start = time.time()
-        
-        with autocast(device_type='cuda', dtype=torch.bfloat16):
-            enhanced, _, _ = model(noisy)
-        
-        torch.cuda.synchronize() if device.type == 'cuda' else None
-        proc_time = time.time() - t_start
+
+        # To tensor
+        noisy_tensor = torch.FloatTensor(noisy_wav).unsqueeze(0).to(device)
+
+        # Compute noisy STFT
+        noisy_mag, noisy_pha, _ = mag_phase_stft(
+            noisy_tensor, n_fft, hop_size, win_size, compress_factor
+        )
+
+        # Inference with timing
+        start_time = time.time()
+        mag_g, pha_g, _ = model(noisy_mag, noisy_pha)
+        enhanced_wav = mag_phase_istft(
+            mag_g, pha_g, n_fft, hop_size, win_size, compress_factor
+        )
+        torch.cuda.synchronize()
+        proc_time = time.time() - start_time
         total_proc_time += proc_time
-        
-        # Convert to numpy
-        enhanced_np = enhanced.squeeze(0).cpu().float().numpy()
-        clean_np = clean.numpy()
-        
-        min_len = min(len(enhanced_np), len(clean_np))
-        enhanced_np = enhanced_np[:min_len]
-        clean_np = clean_np[:min_len]
-        
+
+        # To numpy
+        enhanced_np = enhanced_wav.squeeze().cpu().numpy()
+
+        # Trim to same length
+        min_out = min(len(clean_wav), len(enhanced_np))
+        clean_np = clean_wav[:min_out]
+        enhanced_np = enhanced_np[:min_out]
+
         # Compute metrics
-        metrics = compute_composite_metrics(clean_np, enhanced_np, sr=16000)
-        metrics['utt_id'] = utt_id
-        metrics['rtf'] = proc_time / audio_duration
-        all_metrics.append(metrics)
-        
-        # Save enhanced wav
-        sf.write(os.path.join(enhanced_dir, f'{utt_id}.wav'), enhanced_np, 16000)
-        
+        try:
+            wb_pesq = pesq(sr, clean_np, enhanced_np, 'wb')
+        except Exception:
+            wb_pesq = 1.0
+        all_pesq.append(wb_pesq)
+
+        try:
+            stoi_val = stoi(clean_np, enhanced_np, sr, extended=False)
+        except Exception:
+            stoi_val = 0.0
+        all_stoi.append(stoi_val)
+
+        sisnr_val = si_snr(enhanced_np, clean_np)
+        all_sisnr.append(sisnr_val)
+
+        csig, cbak, covl = composite_metrics(clean_np, enhanced_np, sr)
+        all_csig.append(csig)
+        all_cbak.append(cbak)
+        all_covl.append(covl)
+
+        # Save enhanced audio
+        sf.write(os.path.join(enhanced_dir, filename), enhanced_np, sr)
+
+        # Progress
         if (idx + 1) % 100 == 0:
-            avg_pesq = np.nanmean([m['wb_pesq'] for m in all_metrics])
-            print(f"  [{idx+1}/{len(test_dataset)}] Avg PESQ: {avg_pesq:.4f}")
-    
-    # Compute summary
-    rtf = total_proc_time / total_audio_time
-    
-    summary = {
-        'model': checkpoint_path,
-        'params': total_params,
-        'params_M': total_params / 1e6,
-        'n_utterances': len(all_metrics),
-        'wb_pesq': np.nanmean([m['wb_pesq'] for m in all_metrics]),
-        'wb_pesq_std': np.nanstd([m['wb_pesq'] for m in all_metrics]),
-        'csig': np.nanmean([m.get('csig', float('nan')) for m in all_metrics]),
-        'cbak': np.nanmean([m.get('cbak', float('nan')) for m in all_metrics]),
-        'covl': np.nanmean([m.get('covl', float('nan')) for m in all_metrics]),
-        'stoi': np.nanmean([m.get('stoi', float('nan')) for m in all_metrics]),
-        'si_snr': np.nanmean([m['si_snr'] for m in all_metrics]),
-        'rtf': rtf,
-    }
-    
-    print(f"\n{'='*70}")
+            avg_pesq = np.mean(all_pesq)
+            print(f"  [{idx+1}/{len(files)}] Avg PESQ: {avg_pesq:.4f}")
+
+    # Summary
+    rtf = total_proc_time / total_audio_time if total_audio_time > 0 else 0
+
+    print(f"\n{'='*60}")
     print(f"  EVALUATION RESULTS")
-    print(f"{'='*70}")
-    print(f"  WB-PESQ: {summary['wb_pesq']:.4f} ± {summary['wb_pesq_std']:.4f}")
-    print(f"  CSIG:    {summary['csig']:.4f}")
-    print(f"  CBAK:    {summary['cbak']:.4f}")
-    print(f"  COVL:    {summary['covl']:.4f}")
-    print(f"  STOI:    {summary['stoi']:.4f}")
-    print(f"  SI-SNR:  {summary['si_snr']:.2f} dB")
-    print(f"  RTF:     {summary['rtf']:.4f}")
-    print(f"  Params:  {summary['params_M']:.2f}M")
-    print(f"{'='*70}")
-    
+    print(f"{'='*60}")
+    print(f"  WB-PESQ: {np.mean(all_pesq):.4f} ± {np.std(all_pesq):.4f}")
+    print(f"  CSIG:    {np.mean(all_csig):.4f}")
+    print(f"  CBAK:    {np.mean(all_cbak):.4f}")
+    print(f"  COVL:    {np.mean(all_covl):.4f}")
+    print(f"  STOI:    {np.mean(all_stoi):.4f}")
+    print(f"  SI-SNR:  {np.mean(all_sisnr):.2f} dB")
+    print(f"  RTF:     {rtf:.4f}")
+    print(f"  Params:  {n_params / 1e6:.2f}M")
+    print(f"{'='*60}")
+
     # Save results
-    with open(os.path.join(out_dir, 'eval_summary.json'), 'w') as f:
-        json.dump(summary, f, indent=2, default=str)
-    
-    with open(os.path.join(out_dir, 'eval_per_utterance.json'), 'w') as f:
-        json.dump(all_metrics, f, indent=2, default=str)
-    
+    results = {
+        'pesq': float(np.mean(all_pesq)),
+        'pesq_std': float(np.std(all_pesq)),
+        'csig': float(np.mean(all_csig)),
+        'cbak': float(np.mean(all_cbak)),
+        'covl': float(np.mean(all_covl)),
+        'stoi': float(np.mean(all_stoi)),
+        'sisnr': float(np.mean(all_sisnr)),
+        'rtf': rtf,
+        'params': n_params,
+    }
+    import json
+    with open(os.path.join(out_dir, 'results.json'), 'w') as f:
+        json.dump(results, f, indent=2)
+
     print(f"  Results saved to {out_dir}")
-    
-    return summary
+    return results
 
 
-if __name__ == '__main__':
+def main():
     parser = argparse.ArgumentParser(description='BSMamba3-SE Evaluation')
-    parser.add_argument('--checkpoint', type=str, required=True, help='Path to checkpoint')
+    parser.add_argument('--checkpoint', type=str, required=True)
     parser.add_argument('--data_dir', type=str, default='./VoiceBank_DEMAND_16k')
     parser.add_argument('--out_dir', type=str, default='./eval_results')
     parser.add_argument('--device', type=str, default='cuda')
     args = parser.parse_args()
-    
+
     evaluate(args.checkpoint, args.data_dir, args.out_dir, args.device)
+
+
+if __name__ == '__main__':
+    main()

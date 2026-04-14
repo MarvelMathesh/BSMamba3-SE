@@ -1,164 +1,125 @@
 """
 Perceptual Contrast Stretching (PCS)
-═════════════════════════════════════
-Training-time target modification based on SII critical band importance weights.
+════════════════════════════════════
+Training-time target modification with SII-weighted gamma correction.
 
-PCS applies frequency-dependent gamma correction to the target magnitude spectrum:
-  S_pcs[f] = S[f]^γ(f)
-where γ(f) is derived from the SII (Speech Intelligibility Index) importance function.
+Applies frequency-dependent power-law compression to clean magnitude targets,
+emphasizing perceptually important bands (1–4 kHz formant region).
 
-This is a TARGET modification, not a loss weight. The model learns to weight
-perceptually important frequency bands more strongly. Zero inference overhead.
-
-Expected gain: +0.10-0.14 WB-PESQ (from SEMamba ablation: 3.55 → 3.69).
-Reference: Chao et al. 2022 (PCS technique), SEMamba implementation.
-
-D6: PCS is the highest-gain single trick for Mamba SE. Not using it would
-leave 0.14 PESQ on the table for free.
+Zero inference overhead: PCS only modifies training targets.
 """
 
 import numpy as np
-import torch
-from typing import Optional
+import librosa
+import scipy.signal
 
 
-class PCSTargetTransform:
+# SII critical band importance weights (ANSI S3.5-1997)
+# 21 bands with center frequencies and importance weights
+SII_BANDS = [
+    (150, 0.0083), (250, 0.0095), (350, 0.0150), (450, 0.0289),
+    (570, 0.0440), (700, 0.0578), (840, 0.0653), (1000, 0.0711),
+    (1170, 0.0818), (1370, 0.0844), (1600, 0.0882), (1850, 0.0898),
+    (2150, 0.0868), (2500, 0.0844), (2900, 0.0771), (3400, 0.0527),
+    (4000, 0.0364), (4800, 0.0185), (5800, 0.0000), (7000, 0.0000),
+    (8500, 0.0000),
+]
+
+
+def compute_sii_weights(n_fft: int = 400, sr: int = 16000) -> np.ndarray:
     """
-    Perceptual Contrast Stretching applied to training targets.
+    Interpolate SII importance weights to STFT frequency bins.
     
-    NOT an nn.Module — applied in DataLoader, zero GPU cost.
-    
-    SII critical band importance weights (ANSI S3.5-1997):
-      21 critical bands from 150 Hz to 8500 Hz.
-      Higher importance for speech-critical bands (1000-4000 Hz).
-    
-    Implementation:
-      1. Map STFT bins to SII critical bands
-      2. Compute per-bin gamma = SII_weight^pcs_gamma
-      3. Apply: target_mag_pcs = target_mag ^ gamma
+    Returns:
+        weights: [F] array of per-bin SII importance weights
     """
+    n_bins = n_fft // 2 + 1
+    freqs = np.linspace(0, sr / 2, n_bins)
     
-    # SII Critical Band center frequencies and importance weights
-    # From ANSI S3.5-1997, Table 3 (Band Importance Function for average speech)
-    SII_CENTER_FREQ = np.array([
-        150, 250, 350, 450, 570, 700, 840, 1000, 1170, 1370,
-        1600, 1850, 2150, 2500, 2900, 3400, 4000, 4800, 5800, 7000, 8500
-    ], dtype=np.float64)
+    sii_freqs = np.array([f for f, _ in SII_BANDS])
+    sii_weights = np.array([w for _, w in SII_BANDS])
     
-    SII_IMPORTANCE = np.array([
-        0.0083, 0.0095, 0.0150, 0.0289, 0.0440, 0.0578, 0.0653, 0.0711,
-        0.0818, 0.0844, 0.0882, 0.0898, 0.0868, 0.0844, 0.0771, 0.0527,
-        0.0364, 0.0185, 0.0000, 0.0000, 0.0000
-    ], dtype=np.float64)
+    # Linear interpolation to STFT bins
+    weights = np.interp(freqs, sii_freqs, sii_weights)
+    return weights
+
+
+def compute_pcs_gamma(n_fft: int = 400, sr: int = 16000, gamma: float = 0.3) -> np.ndarray:
+    """
+    Compute per-frequency-bin gamma exponent for PCS.
     
-    def __init__(
-        self,
-        n_fft: int = 512,
-        sr: int = 16000,
-        pcs_gamma: float = 0.3,
-        enabled: bool = True,
-    ):
-        """
-        Args:
-            n_fft: FFT size (determines number of freq bins)
-            sr: sample rate
-            pcs_gamma: exponent for SII importance → gamma mapping.
-                       0.3 is conservative (from SEMamba paper).
-                       Do NOT use 1.0+ (causes fricative degradation, D6 failure mode 4).
-            enabled: set False for ablation A7
-        """
-        self.n_fft = n_fft
-        self.sr = sr
-        self.pcs_gamma = pcs_gamma
-        self.enabled = enabled
-        
-        # Compute per-bin gamma weights
-        self._compute_gamma_weights()
+    gamma(f) = 1 - (w_SII(f) / max(w_SII))^gamma0 × 0.5
     
-    def _compute_gamma_weights(self):
-        """
-        Map STFT frequency bins to SII importance weights,
-        then compute gamma correction exponents.
-        """
-        n_bins = self.n_fft // 2 + 1  # 257 for n_fft=512
-        bin_freqs = np.linspace(0, self.sr / 2, n_bins)  # [0, 8000] Hz
-        
-        # Interpolate SII importance to STFT bin frequencies
-        sii_weights = np.interp(
-            bin_freqs,
-            self.SII_CENTER_FREQ,
-            self.SII_IMPORTANCE,
-            left=self.SII_IMPORTANCE[0],
-            right=0.0
-        )
-        
-        # Normalize to [0, 1] range
-        sii_max = sii_weights.max()
-        if sii_max > 0:
-            sii_weights_norm = sii_weights / sii_max
-        else:
-            sii_weights_norm = np.ones_like(sii_weights)
-        
-        # Gamma = 1 - sii_weight^pcs_gamma * 0.5
-        # This means: high-importance bands get gamma < 1 (expansion),
-        # low-importance bands get gamma ≈ 1 (no change)
-        # The stretching emphasizes perceptually critical frequencies.
-        self.gamma_weights = 1.0 - (sii_weights_norm ** self.pcs_gamma) * 0.5
-        
-        # Ensure gamma stays in reasonable range [0.3, 1.0]
-        self.gamma_weights = np.clip(self.gamma_weights, 0.3, 1.0)
-        
-        # Convert to torch tensor
-        self.gamma_tensor = torch.from_numpy(
-            self.gamma_weights.astype(np.float32)
-        )  # [257]
+    High-importance bands: gamma ≈ 0.5 (square-root expansion)
+    Low-importance bands:  gamma ≈ 1.0 (no modification)
     
-    def apply(self, target_mag: torch.Tensor) -> torch.Tensor:
-        """
-        Apply PCS gamma correction to target magnitude spectrum.
-        
-        Args:
-            target_mag: [B, T, F] or [B, F, T] magnitude spectrum (positive values)
-        
-        Returns:
-            pcs_mag: same shape, with PCS-modified magnitudes
-        """
-        if not self.enabled:
-            return target_mag
-        
-        gamma = self.gamma_tensor.to(target_mag.device)
-        
-        # Handle both [B, T, F] and [B, F, T] layouts
-        if target_mag.shape[-1] == len(gamma):
-            # [B, T, F] layout
-            return target_mag.clamp(min=1e-10) ** gamma.unsqueeze(0).unsqueeze(0)
-        elif target_mag.shape[1] == len(gamma):
-            # [B, F, T] layout
-            return target_mag.clamp(min=1e-10) ** gamma.unsqueeze(0).unsqueeze(-1)
-        else:
-            # Fallback: no PCS (dimension doesn't match)
-            return target_mag
+    Returns:
+        gammas: [F] per-bin gamma exponents, clipped to [0.3, 1.0]
+    """
+    weights = compute_sii_weights(n_fft, sr)
+    max_w = weights.max()
     
-    def apply_to_complex_stft(
-        self,
-        target_stft: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Apply PCS to complex STFT by modifying magnitude while preserving phase.
-        
-        Args:
-            target_stft: [B, F, T] complex STFT
-        
-        Returns:
-            pcs_stft: [B, F, T] complex STFT with PCS-modified magnitudes
-        """
-        if not self.enabled:
-            return target_stft
-        
-        mag = target_stft.abs()          # [B, F, T]
-        phase = target_stft.angle()       # [B, F, T]
-        
-        pcs_mag = self.apply(mag)         # [B, F, T]
-        
-        # Reconstruct complex with modified magnitude and original phase
-        return pcs_mag * torch.exp(1j * phase)
+    if max_w < 1e-10:
+        return np.ones(n_fft // 2 + 1)
+    
+    normalized = (weights / max_w) ** gamma
+    gammas = 1.0 - normalized * 0.5
+    gammas = np.clip(gammas, 0.3, 1.0)
+    
+    return gammas
+
+
+def apply_pcs_to_waveform(
+    signal: np.ndarray,
+    n_fft: int = 400,
+    hop_size: int = 100,
+    win_size: int = 400,
+    gamma: float = 0.3,
+) -> np.ndarray:
+    """
+    Apply PCS to a clean waveform as training target modification.
+    
+    Pipeline:
+      1. STFT → magnitude + phase
+      2. Apply per-bin gamma correction to magnitude
+      3. iSTFT → modified waveform
+    
+    Args:
+        signal: clean waveform (numpy array)
+        n_fft, hop_size, win_size: STFT parameters
+        gamma: PCS exponent (0.3 = conservative)
+    
+    Returns:
+        pcs_signal: PCS-modified waveform (numpy array)
+    """
+    # Compute per-bin gamma exponents
+    gammas = compute_pcs_gamma(n_fft, sr=16000, gamma=gamma)
+    
+    # STFT
+    window = scipy.signal.windows.hann(win_size)
+    S = librosa.stft(
+        signal, n_fft=n_fft, hop_length=hop_size,
+        win_length=win_size, window=window,
+    )
+    
+    mag = np.abs(S)
+    phase = np.angle(S)
+    
+    # Apply per-frequency gamma correction
+    # gammas shape: [F], mag shape: [F, T]
+    eps = 1e-10
+    mag_pcs = np.power(mag + eps, gammas[:, np.newaxis])
+    
+    # Reconstruct
+    S_pcs = mag_pcs * np.exp(1j * phase)
+    signal_pcs = librosa.istft(
+        S_pcs, hop_length=hop_size, win_length=win_size,
+        window=window, length=len(signal),
+    )
+    
+    # Normalize to prevent clipping
+    max_val = np.max(np.abs(signal_pcs))
+    if max_val > 0:
+        signal_pcs = signal_pcs / max_val
+    
+    return signal_pcs.astype(np.float32)

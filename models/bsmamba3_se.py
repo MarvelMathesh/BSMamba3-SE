@@ -1,591 +1,388 @@
 """
 BSMamba3-SE: Band-Split Mamba3 Speech Enhancement
-═══════════════════════════════════════════════════
-First exploitation of complex-valued MIMO state spaces for sub-band
-harmonic tracking in monaural speech enhancement.
+══════════════════════════════════════════════════
+Architecture: Compressed Mag+Phase → DenseEncoder → N×TFMamba3Block → MagDecoder+PhaseDecoder → ISTFT
 
-Architecture: STFT → Band-Split → N×(Mamba3IntraBand + InterBandAttn + SwiGLU) → Band-Merge → CRM → ISTFT
+Key innovations over SEMamba:
+  1. Mamba3 trapezoidal discretization → zero phase-drift for harmonic tracking
+  2. Complex-valued MIMO states → direct oscillatory mode modelling
+  3. Bidirectional TF processing with Mamba3 on both time and frequency axes
+  4. Architecture-aligned temporal coherence loss (L_tc)
+  5. PCS with SII-weighted gamma correction
 
-References:
-  - Mamba3 (Dao et al., 2026): complex-valued SSM with MIMO and trapezoidal discretization
-  - SEMamba (Chao et al., SLT 2024): first Mamba application to SE (Mamba1)
-  - BSRNN (Luo & Yu, 2023): band-split processing for speech separation
-  - MambAttention (Kühne et al., INTERSPEECH 2025): Mamba+attention for SE generalization
+Engineering recipe from MP-SENet/SEMamba:
+  - n_fft=400, hop=100, compress_factor=0.3
+  - DenseBlock encoder with dilated convolutions
+  - Separate MagDecoder (LearnableSigmoid) + PhaseDecoder (atan2)
+  - MetricGAN adversarial training
 """
 
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, Tuple, Optional, Dict
+from einops import rearrange
+from typing import Tuple
+
+from models.lsigmoid import LearnableSigmoid2D
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# MULTI-SCALE STFT ENCODER
+# STFT UTILITIES
 # ═══════════════════════════════════════════════════════════════════════════
 
-class MultiScaleSTFT(nn.Module):
+def mag_phase_stft(y, n_fft, hop_size, win_size, compress_factor=1.0, center=True, addeps=False):
     """
-    Three-scale STFT analysis for multi-resolution spectral representation.
+    Compute magnitude and phase from STFT with optional power-law compression.
+
+    Args:
+        y: [B, L] or [B, 1, L] waveform
+        compress_factor: power-law compression exponent (0.3 = cube root)
+
+    Returns:
+        mag: [B, F, T] compressed magnitude
+        pha: [B, F, T] phase
+        com: [B, F, T, 2] compressed complex (mag*cos, mag*sin)
+    """
+    eps = 1e-10
+    if y.dim() == 3:
+        y = y.squeeze(1)
+    hann_window = torch.hann_window(win_size).to(y.device)
+    stft_spec = torch.stft(
+        y, n_fft, hop_length=hop_size, win_length=win_size,
+        window=hann_window, center=center, pad_mode='reflect',
+        normalized=False, return_complex=True
+    )
+
+    if not addeps:
+        mag = torch.abs(stft_spec)
+        pha = torch.angle(stft_spec)
+    else:
+        real_part = stft_spec.real
+        imag_part = stft_spec.imag
+        mag = torch.sqrt(real_part.pow(2) + imag_part.pow(2) + eps)
+        pha = torch.atan2(imag_part + eps, real_part + eps)
+
+    # Power-law compression
+    mag = torch.pow(mag, compress_factor)
+    com = torch.stack((mag * torch.cos(pha), mag * torch.sin(pha)), dim=-1)
+    return mag, pha, com
+
+
+def mag_phase_istft(mag, pha, n_fft, hop_size, win_size, compress_factor=1.0, center=True):
+    """
+    Inverse STFT: decompress magnitude, combine with phase, reconstruct waveform.
+    """
+    mag = torch.pow(mag, 1.0 / compress_factor)
+    # PyTorch torch.complex does not support bfloat16
+    real_part = (mag * torch.cos(pha)).float()
+    imag_part = (mag * torch.sin(pha)).float()
+    com = torch.complex(real_part, imag_part)
+    hann_window = torch.hann_window(win_size).to(com.device)
+    wav = torch.istft(
+        com, n_fft, hop_length=hop_size, win_length=win_size,
+        window=hann_window, center=center
+    )
+    return wav
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DENSE CONVOLUTIONAL BLOCKS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def get_padding_2d(kernel_size, dilation=(1, 1)):
+    """Calculate same-padding for 2D conv with dilation."""
+    return (
+        int((kernel_size[0] * dilation[0] - dilation[0]) / 2),
+        int((kernel_size[1] * dilation[1] - dilation[1]) / 2),
+    )
+
+
+class DenseBlock(nn.Module):
+    """
+    4-layer dilated dense convolution block with InstanceNorm and PReLU.
     
-    Scales (all Hann window):
-      Scale 1 (primary): N=512, hop=256, win=512 → F=257 bins, 31.25 Hz/bin
-      Scale 2 (aux mid):  N=256, hop=128, win=256 → F=129 bins, 62.5 Hz/bin
-      Scale 3 (aux fine): N=128, hop=64,  win=128 → F=65 bins, 125 Hz/bin
-
-    WHY three scales: Multi-scale spectral loss (Adefossé 2022, HiFi-GAN family)
-    adds +0.03-0.05 PESQ at near-zero compute. Scale 3 captures plosive bursts (<8ms).
-    Scale 1 resolves harmonics (F0=100Hz → 3.2 bins apart).
+    Dilations: [1, 2, 4, 8] → effective receptive field of 15 frames.
+    Dense connectivity: each layer receives all previous outputs concatenated.
+    
+    This captures local spectral patterns (formants, harmonics) before
+    Mamba3 processes long-range temporal dependencies.
     """
 
-    def __init__(self):
+    def __init__(self, hid_feature: int, kernel_size=(3, 3), depth: int = 4):
         super().__init__()
-        # Scale configs: (n_fft, hop_length, win_length)
-        self.scales = [
-            (512, 256, 512),   # Primary scale: F=257, time res ~16ms
-            (256, 128, 256),   # Auxiliary mid:  F=129, time res ~8ms
-            (128, 64,  128),   # Auxiliary fine: F=65,  time res ~4ms
-        ]
-        # Register Hann windows as buffers (non-trainable, device-tracked)
-        for i, (n_fft, _, win_length) in enumerate(self.scales):
-            self.register_buffer(f'window_{i}', torch.hann_window(win_length))
+        self.depth = depth
+        self.dense_block = nn.ModuleList()
 
-    def forward(self, x: torch.Tensor) -> Tuple[List[torch.Tensor], torch.Tensor]:
-        """
-        Args:
-            x: [B, L] waveform at 16kHz
-
-        Returns:
-            stfts: list of 3 complex tensors [B, F_k, T_k] for each scale
-            primary_stft: [B, T, 257] complex tensor (primary scale, transposed for BSE)
-        """
-        B, L = x.shape
-        stfts = []
-
-        for i, (n_fft, hop_length, win_length) in enumerate(self.scales):
-            window = getattr(self, f'window_{i}')
-            # Compute complex STFT
-            spec = torch.stft(
-                x, n_fft=n_fft, hop_length=hop_length, win_length=win_length,
-                window=window, return_complex=True, center=True, pad_mode='reflect',
-                normalized=False
-            )  # [B, F_k, T_k]
-            stfts.append(spec)
-
-        # Primary STFT: [B, 257, T] → [B, T, 257] for BSE processing
-        primary_stft = stfts[0].transpose(1, 2)  # [B, T, 257]
-
-        return stfts, primary_stft
-
-    def istft(self, spec: torch.Tensor, length: int) -> torch.Tensor:
-        """
-        Inverse STFT using primary scale parameters.
-
-        Args:
-            spec: [B, 257, T] complex STFT
-            length: target waveform length
-
-        Returns:
-            waveform: [B, L]
-        """
-        n_fft, hop_length, win_length = self.scales[0]
-        return torch.istft(
-            spec, n_fft=n_fft, hop_length=hop_length, win_length=win_length,
-            window=self.window_0, center=True, length=length,
-            normalized=False
-        )
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# BAND-SPLIT ENCODER
-# ═══════════════════════════════════════════════════════════════════════════
-
-class BandSplitEncoder(nn.Module):
-    """
-    Acoustically-motivated band-split encoding.
-
-    K=8 sub-bands with boundaries tuned to speech formant structure:
-      Band 0: [0, 250] Hz     — F0 fundamental (8 bins)
-      Band 1: [250, 500] Hz   — F0 harmonics / F1 onset (8 bins)
-      Band 2: [500, 750] Hz   — F1 center (8 bins)
-      Band 3: [750, 1000] Hz  — F1 upper (8 bins)
-      Band 4: [1000, 1500] Hz — F2 onset (16 bins)
-      Band 5: [1500, 2000] Hz — F2 center (16 bins)
-      Band 6: [2000, 3000] Hz — F2-F3 transition (32 bins)
-      Band 7: [3000, 8000] Hz — F3 + consonants + noise floor (161 bins)
-
-    D3: K=8 gives K/R = 8/4 = 2 bands per MIMO unit. Each MIMO unit jointly
-    models one acoustically paired frequency region.
-
-    Multi-scale fusion: auxiliary scale features projected and summed with
-    learned scale weights [1.0, 0.5, 0.25] (normalized via softmax).
-    """
-
-    def __init__(self, d_model: int = 256, n_bands: int = 8):
-        super().__init__()
-        self.d_model = d_model
-        self.n_bands = n_bands
-
-        # Band boundaries in STFT bin indices (NFFT=512, sr=16000, bin_width=31.25Hz)
-        # Bin = freq / (sr/n_fft) = freq / 31.25
-        # Boundaries (Hz): [0, 250, 500, 750, 1000, 1500, 2000, 3000, 8000]
-        # Bins:            [0,   8,  16,  24,   32,   48,   64,   96,  257]
-        self.band_bins = [
-            (0, 8),      # Band 0: bins 0-7,    8 bins  → [0, 250) Hz
-            (8, 16),     # Band 1: bins 8-15,   8 bins  → [250, 500) Hz
-            (16, 24),    # Band 2: bins 16-23,  8 bins  → [500, 750) Hz
-            (24, 32),    # Band 3: bins 24-31,  8 bins  → [750, 1000) Hz
-            (32, 48),    # Band 4: bins 32-47,  16 bins → [1000, 1500) Hz
-            (48, 64),    # Band 5: bins 48-63,  16 bins → [1500, 2000) Hz
-            (64, 96),    # Band 6: bins 64-95,  32 bins → [2000, 3000) Hz
-            (96, 257),   # Band 7: bins 96-256, 161 bins → [3000, 8000) Hz
-        ]
-
-        # Per-band projections: Linear(2*n_bins, D) (real+imag concatenated)
-        self.band_projections = nn.ModuleList()
-        self.band_norms = nn.ModuleList()
-        for start, end in self.band_bins:
-            n_bins = end - start
-            self.band_projections.append(
-                nn.Linear(2 * n_bins, d_model)  # 2× for real + imag
+        for i in range(depth):
+            dil = 2 ** i  # 1, 2, 4, 8
+            dense_conv = nn.Sequential(
+                nn.Conv2d(
+                    hid_feature * (i + 1), hid_feature, kernel_size,
+                    dilation=(dil, 1),
+                    padding=get_padding_2d(kernel_size, (dil, 1)),
+                ),
+                nn.InstanceNorm2d(hid_feature, affine=True),
+                nn.PReLU(hid_feature),
             )
-            self.band_norms.append(nn.LayerNorm(d_model))
+            self.dense_block.append(dense_conv)
 
-        # Multi-scale fusion: auxiliary scale projections
-        # Scale 2 (N=256): F=129, need to project per-band segments to D
-        # Scale 3 (N=128): F=65, need to project per-band segments to D
-        # We compute approximate band boundaries for auxiliary scales
-        self.aux_scale_projections = nn.ModuleList()
-        for scale_idx in range(2):  # scales 1 and 2 (0-indexed aux)
-            scale_band_projs = nn.ModuleList()
-            for band_idx in range(n_bands):
-                start, end = self.band_bins[band_idx]
-                # Scale down bin indices: scale2 has 129 bins, scale3 has 65 bins
-                if scale_idx == 0:  # Scale 2: NFFT=256, 129 bins
-                    s_start = start // 2
-                    s_end = max(s_start + 1, end // 2)
-                else:  # Scale 3: NFFT=128, 65 bins
-                    s_start = start // 4
-                    s_end = max(s_start + 1, end // 4)
-                n_bins_aux = s_end - s_start
-                scale_band_projs.append(nn.Linear(2 * n_bins_aux, d_model))
-            self.aux_scale_projections.append(scale_band_projs)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        skip = x
+        for i in range(self.depth):
+            x = self.dense_block[i](skip)
+            skip = torch.cat([x, skip], dim=1)
+        return x
 
-        # Learned scale weights: init [1.0, 0.5, 0.25], normalized via softmax
-        self.scale_weights = nn.Parameter(
-            torch.tensor([1.0, 0.5, 0.25], dtype=torch.float32)
+
+class DenseEncoder(nn.Module):
+    """
+    Front-end encoder: Conv2d → DenseBlock → stride Conv2d.
+    
+    Input: [B, 2, T, F=201] (compressed mag + phase)
+    Output: [B, C=64, T, F'=100] (downsampled in frequency)
+    """
+
+    def __init__(self, in_channel: int = 2, hid_feature: int = 64):
+        super().__init__()
+        self.dense_conv_1 = nn.Sequential(
+            nn.Conv2d(in_channel, hid_feature, (1, 1)),
+            nn.InstanceNorm2d(hid_feature, affine=True),
+            nn.PReLU(hid_feature),
+        )
+        self.dense_block = DenseBlock(hid_feature, depth=4)
+        self.dense_conv_2 = nn.Sequential(
+            nn.Conv2d(hid_feature, hid_feature, (1, 3), stride=(1, 2)),
+            nn.InstanceNorm2d(hid_feature, affine=True),
+            nn.PReLU(hid_feature),
         )
 
-    def _get_aux_band_bins(self, band_idx: int, scale_idx: int) -> Tuple[int, int]:
-        """Get bin range for auxiliary scale."""
-        start, end = self.band_bins[band_idx]
-        if scale_idx == 0:  # Scale 2: NFFT=256
-            s_start = start // 2
-            s_end = max(s_start + 1, end // 2)
-        else:  # Scale 3: NFFT=128
-            s_start = start // 4
-            s_end = max(s_start + 1, end // 4)
-        return s_start, s_end
-
-    def forward(
-        self,
-        stfts: List[torch.Tensor],
-        primary_stft: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            stfts: list of 3 complex STFT tensors [B, F_k, T_k]
-            primary_stft: [B, T, 257] complex primary STFT
-
-        Returns:
-            z: [B, T, K=8, D=256] band-split features
-            primary_stft: [B, T, 257] passed through for CRM application
-        """
-        B, T, num_bins = primary_stft.shape  # T = time frames, num_bins = 257
-        scale_w = F.softmax(self.scale_weights, dim=0)  # [3]
-
-        band_features = []
-        for band_idx in range(self.n_bands):
-            start, end = self.band_bins[band_idx]
-
-            # Primary scale: extract band, concat real+imag
-            band_complex = primary_stft[:, :, start:end]  # [B, T, n_bins]
-            band_ri = torch.cat([
-                band_complex.real,
-                band_complex.imag
-            ], dim=-1)  # [B, T, 2*n_bins]
-
-            # Project to D-dimensional space
-            h = self.band_projections[band_idx](band_ri)  # [B, T, D]
-            h = self.band_norms[band_idx](h)               # [B, T, D]
-            h = h * scale_w[0]  # Weight primary scale
-
-            # Auxiliary scales: project then add with scale weights
-            for scale_idx in range(2):
-                aux_stft = stfts[scale_idx + 1]  # [B, F_aux, T_aux]
-                aux_stft_t = aux_stft.transpose(1, 2)  # [B, T_aux, F_aux]
-
-                # Adaptive average pool to match primary T
-                T_aux = aux_stft_t.shape[1]
-                if T_aux != T:
-                    # Pool real and imag separately
-                    aux_real = F.adaptive_avg_pool1d(
-                        aux_stft_t.real.transpose(1, 2), T
-                    ).transpose(1, 2)  # [B, T, F_aux]
-                    aux_imag = F.adaptive_avg_pool1d(
-                        aux_stft_t.imag.transpose(1, 2), T
-                    ).transpose(1, 2)  # [B, T, F_aux]
-                else:
-                    aux_real = aux_stft_t.real
-                    aux_imag = aux_stft_t.imag
-
-                s_start, s_end = self._get_aux_band_bins(band_idx, scale_idx)
-                # Clamp to actual frequency bins available
-                F_aux = aux_real.shape[2]
-                s_end = min(s_end, F_aux)
-                s_start = min(s_start, F_aux - 1)
-
-                aux_band_ri = torch.cat([
-                    aux_real[:, :, s_start:s_end],
-                    aux_imag[:, :, s_start:s_end]
-                ], dim=-1)  # [B, T, 2*n_bins_aux]
-
-                h_aux = self.aux_scale_projections[scale_idx][band_idx](aux_band_ri)  # [B, T, D]
-                h = h + h_aux * scale_w[scale_idx + 1]
-
-            band_features.append(h)  # [B, T, D]
-
-        # Stack bands: [B, T, K=8, D=256]
-        z = torch.stack(band_features, dim=2)  # [B, T, K, D]
-
-        return z, primary_stft
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.dense_conv_1(x)   # [B, C, T, F=201]
+        x = self.dense_block(x)    # [B, C, T, F=201]
+        x = self.dense_conv_2(x)   # [B, C, T, F'=100]
+        return x
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Mamba3 INTRA-BAND BLOCK
+# BIDIRECTIONAL MAMBA3 BLOCK
 # ═══════════════════════════════════════════════════════════════════════════
 
-class Mamba3IntraBandBlock(nn.Module):
+class BiMamba3Block(nn.Module):
     """
-    Temporal SSM processing within each band using Mamba3.
-
-    Reshapes [B, T, K, D] → [B*K, T, D], applies Mamba3, reshapes back.
-    Each band gets independent temporal processing with complex-valued states
-    (Innovation 2: harmonic tracking) and MIMO cross-head coupling (Innovation 3).
-
-    SHAPE CONSTRAINTS (verified, non-negotiable):
-      n_heads = d_model / headdim = 256 / 64 = 4
-      mimo_rank = 4 ≤ n_heads = 4 ✓
-      chunk_size = 64 / mimo_rank = 16 (for bf16) ✓
+    Bidirectional Mamba3 processing: forward + reverse pass concatenated.
+    
+    Mamba3 innovations exploited here:
+      1. Trapezoidal (bilinear) discretization → zero phase-drift
+      2. Complex-valued states → direct harmonic mode modelling
+      3. MIMO rank-R coupling → cross-head information flow
+    
+    Output is 2× input channels (forward + backward concatenated).
     """
 
     def __init__(
         self,
-        d_model: int = 256,
-        d_state: int = 128,
-        headdim: int = 64,
+        d_model: int = 64,
+        d_state: int = 16,
+        headdim: int = 16,
         mimo_rank: int = 4,
         chunk_size: int = 16,
-        layer_idx: Optional[int] = None,
-        n_bands: int = 8,
     ):
         super().__init__()
-        self.d_model = d_model
-        self.n_bands = n_bands
+        self.chunk_size = chunk_size
+        self.norm_f = nn.LayerNorm(d_model)
+        self.norm_b = nn.LayerNorm(d_model)
 
-        # Validate Mamba3 shape constraints — D1, D4
-        n_heads = d_model // headdim
-        assert d_model % headdim == 0, \
-            f"d_model={d_model} must be divisible by headdim={headdim}"
-        assert mimo_rank <= n_heads, \
-            f"mimo_rank={mimo_rank} must be ≤ n_heads={n_heads}"
-        assert chunk_size == 64 // mimo_rank, \
-            f"chunk_size must be 64/mimo_rank={64 // mimo_rank} for bf16"
-
-        self.norm = nn.LayerNorm(d_model)
-
-        # Import Mamba3 at module level
         from mamba_ssm import Mamba3
-        self.mamba3 = Mamba3(
+        self.mamba3_forward = Mamba3(
             d_model=d_model,
             d_state=d_state,
             headdim=headdim,
             is_mimo=True,
             mimo_rank=mimo_rank,
             chunk_size=chunk_size,
-            is_outproj_norm=False,
-            layer_idx=layer_idx,
-            dtype=torch.bfloat16,
         )
-
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            z: [B, T, K, D] band-split features
-
-        Returns:
-            z_out: [B, T, K, D] with temporal Mamba3 processing + residual
-        """
-        B, T, K, D = z.shape
-
-        # Pre-norm
-        z_in = self.norm(z)  # [B, T, K, D]
-
-        # Reshape for Mamba3: [B*K, T, D]
-        z_r = z_in.permute(0, 2, 1, 3).contiguous()  # [B, K, T, D]
-        z_r = z_r.reshape(B * K, T, D)                 # [B*K, T, D]
-
-        # Apply Mamba3 — complex-valued MIMO SSM
-        z_r = self.mamba3(z_r)  # [B*K, T, D]
-
-        # Reshape back
-        z_r = z_r.reshape(B, K, T, D)                  # [B, K, T, D]
-        z_r = z_r.permute(0, 2, 1, 3)                  # [B, T, K, D]
-
-        # Residual connection
-        return z + z_r
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# INTER-BAND ATTENTION
-# ═══════════════════════════════════════════════════════════════════════════
-
-class InterBandAttention(nn.Module):
-    """
-    Local window cross-band attention for inter-band coupling.
-
-    Applies MHA over groups of 4 adjacent bands (2 non-overlapping windows
-    for K=8 bands). This addresses the MambAttention (2025) finding that
-    pure SSM models overfit — attention provides generalization.
-
-    D7: Local window size=4, not full K×K.
-      Full K×K = O(64T), windowed = O(16T). Redundant with MIMO for adj bands.
-    """
-
-    def __init__(self, d_model: int = 256, n_heads: int = 4, window_size: int = 4, n_bands: int = 8):
-        super().__init__()
-        self.d_model = d_model
-        self.n_heads = n_heads
-        self.window_size = window_size
-        self.n_bands = n_bands
-        self.n_windows = n_bands // window_size
-
-        self.norm = nn.LayerNorm(d_model)
-        self.mha = nn.MultiheadAttention(
-            embed_dim=d_model,
-            num_heads=n_heads,
-            dropout=0.0,
-            batch_first=True,
-        )
-
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            z: [B, T, K=8, D=256]
-
-        Returns:
-            z_out: [B, T, K, D] with inter-band attention + residual
-        """
-        B, T, K, D = z.shape
-
-        # Pre-norm
-        z_in = self.norm(z)  # [B, T, K, D]
-
-        # Reshape: [B*T, K, D] for attention over bands
-        z_r = z_in.reshape(B * T, K, D)  # [B*T, K, D]
-
-        # Process non-overlapping windows of size 4
-        out_parts = []
-        for w_idx in range(self.n_windows):
-            w_start = w_idx * self.window_size
-            w_end = w_start + self.window_size
-            seg = z_r[:, w_start:w_end, :]  # [B*T, 4, D]
-
-            # Standard MHA within window
-            attn_out, _ = self.mha(seg, seg, seg)  # [B*T, 4, D]
-            out_parts.append(attn_out)
-
-        # Concatenate windows back
-        z_attn = torch.cat(out_parts, dim=1)  # [B*T, K, D]
-        z_attn = z_attn.reshape(B, T, K, D)    # [B, T, K, D]
-
-        return z + z_attn
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# SwiGLU FFN
-# ═══════════════════════════════════════════════════════════════════════════
-
-class SwiGLUFFN(nn.Module):
-    """
-    SwiGLU feed-forward network (Shazeer 2020, PaLM, LLaMA).
-
-    gate = Linear(D, 4D)
-    up   = Linear(D, 4D)
-    out  = Linear(4D, D)(SiLU(gate) * up)
-
-    SwiGLU consistently outperforms GELU-FFN in modern architectures.
-    The 4D expansion matches GPT-style FFN but with gated activation.
-    """
-
-    def __init__(self, d_model: int = 256, expansion: int = 4):
-        super().__init__()
-        d_ff = d_model * expansion
-        self.norm = nn.LayerNorm(d_model)
-        self.gate_proj = nn.Linear(d_model, d_ff, bias=False)
-        self.up_proj = nn.Linear(d_model, d_ff, bias=False)
-        self.down_proj = nn.Linear(d_ff, d_model, bias=False)
-
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            z: [B, T, K, D]
-
-        Returns:
-            z_out: [B, T, K, D] with SwiGLU FFN + residual
-        """
-        z_in = self.norm(z)  # [B, T, K, D]
-        gate = self.gate_proj(z_in)    # [B, T, K, 4D]
-        up = self.up_proj(z_in)        # [B, T, K, 4D]
-        z_ffn = self.down_proj(F.silu(gate) * up)  # [B, T, K, D]
-        return z + z_ffn
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# BSMamba3 BACKBONE BLOCK
-# ═══════════════════════════════════════════════════════════════════════════
-
-class BSMamba3Block(nn.Module):
-    """
-    Single BSMamba3 backbone block combining all three sub-modules:
-      (a) Mamba3IntraBandBlock — temporal SSM with complex MIMO states
-      (b) InterBandAttention — local window cross-band attention
-      (c) SwiGLUFFN — gated feed-forward
-
-    All with pre-norm (LayerNorm) and residual connections.
-    """
-
-    def __init__(
-        self,
-        d_model: int = 256,
-        d_state: int = 128,
-        headdim: int = 64,
-        mimo_rank: int = 4,
-        chunk_size: int = 16,
-        n_bands: int = 8,
-        attn_heads: int = 4,
-        attn_window: int = 4,
-        ffn_expansion: int = 4,
-        layer_idx: Optional[int] = None,
-    ):
-        super().__init__()
-        self.intra_band = Mamba3IntraBandBlock(
+        self.mamba3_backward = Mamba3(
             d_model=d_model,
             d_state=d_state,
             headdim=headdim,
+            is_mimo=True,
             mimo_rank=mimo_rank,
             chunk_size=chunk_size,
-            layer_idx=layer_idx,
-            n_bands=n_bands,
-        )
-        self.inter_band = InterBandAttention(
-            d_model=d_model,
-            n_heads=attn_heads,
-            window_size=attn_window,
-            n_bands=n_bands,
-        )
-        self.ffn = SwiGLUFFN(
-            d_model=d_model,
-            expansion=ffn_expansion,
         )
 
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
+    def _pad_to_chunk(self, x: torch.Tensor) -> Tuple[torch.Tensor, int]:
+        """Pad sequence length to multiple of chunk_size."""
+        L = x.shape[1]
+        pad = (self.chunk_size - L % self.chunk_size) % self.chunk_size
+        if pad > 0:
+            x = F.pad(x, (0, 0, 0, pad))
+        return x, pad
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            z: [B, T, K=8, D=256]
-
+            x: [BN, L, C] where BN is batch*freq or batch*time
         Returns:
-            z_out: [B, T, K, D]
+            y: [BN, L, 2C] bidirectional output
         """
-        z = self.intra_band(z)   # (a) Temporal Mamba3 SSM
-        z = self.inter_band(z)   # (b) Cross-band attention
-        z = self.ffn(z)          # (c) SwiGLU FFN
-        return z
+        L_orig = x.shape[1]
+
+        # Forward direction
+        x_f, pad = self._pad_to_chunk(self.norm_f(x))
+        y_f = self.mamba3_forward(x_f)
+        if pad > 0:
+            y_f = y_f[:, :L_orig, :]
+
+        # Backward direction
+        x_b = torch.flip(x, [1])
+        x_b, pad = self._pad_to_chunk(self.norm_b(x_b))
+        y_b = self.mamba3_backward(x_b)
+        if pad > 0:
+            y_b = y_b[:, :L_orig, :]
+        y_b = torch.flip(y_b, [1])
+
+        return torch.cat([y_f, y_b], dim=-1)  # [BN, L, 2C]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# BAND-MERGE DECODER
+# TIME-FREQUENCY MAMBA3 BLOCK
 # ═══════════════════════════════════════════════════════════════════════════
 
-class BandMergeDecoder(nn.Module):
+class TFMamba3Block(nn.Module):
     """
-    Band-merge decoder producing Complex Ratio Mask (CRM).
-
-    Per-band de-projection: Linear(D, 2*n_bins) → real + imag mask components.
-    Bands reassembled → full-spectrum CRM.
-    CRM activation: tanh on both real and imaginary (D8: bounds in [-1,1]).
-
-    Enhanced signal: Ŝ = (M_r + j·M_i) × Y_complex (complex multiply).
+    Dual-axis bidirectional Mamba3 block processing BOTH time and frequency.
+    
+    1. Time-Mamba3: each frequency bin processed temporally [B*F', T, C] → bidirectional
+    2. Freq-Mamba3: each time frame processed spectrally [B*T, F', C] → bidirectional
+    
+    Both with residual connections via ConvTranspose1d projection (2C → C).
+    
+    This is the core architectural contribution: Mamba3 (trapezoidal, complex, MIMO)
+    replaces Mamba1 (ZOH, real, SISO) on both axes.
     """
 
-    def __init__(self, d_model: int = 256, n_bands: int = 8):
+    def __init__(self, hid_feature: int = 64, d_state: int = 16,
+                 headdim: int = 16, mimo_rank: int = 4, chunk_size: int = 16):
         super().__init__()
-        self.d_model = d_model
-        self.n_bands = n_bands
+        self.hid_feature = hid_feature
 
-        # Same band boundaries as encoder
-        self.band_bins = [
-            (0, 8), (8, 16), (16, 24), (24, 32),
-            (32, 48), (48, 64), (64, 96), (96, 257),
-        ]
+        # Bidirectional Mamba3 for temporal axis
+        self.time_mamba = BiMamba3Block(
+            d_model=hid_feature, d_state=d_state, headdim=headdim,
+            mimo_rank=mimo_rank, chunk_size=chunk_size,
+        )
+        # Bidirectional Mamba3 for frequency axis
+        self.freq_mamba = BiMamba3Block(
+            d_model=hid_feature, d_state=d_state, headdim=headdim,
+            mimo_rank=mimo_rank, chunk_size=chunk_size,
+        )
 
-        # Per-band de-projections: Linear(D, 2*n_bins) for CRM real+imag
-        self.band_deprojections = nn.ModuleList()
-        self.band_norms = nn.ModuleList()
-        for start, end in self.band_bins:
-            n_bins = end - start
-            self.band_norms.append(nn.LayerNorm(d_model))
-            self.band_deprojections.append(
-                nn.Linear(d_model, 2 * n_bins)
-            )
+        # Projection from 2C → C (concat of forward+backward)
+        self.tlinear = nn.ConvTranspose1d(hid_feature * 2, hid_feature, 1, stride=1)
+        self.flinear = nn.ConvTranspose1d(hid_feature * 2, hid_feature, 1, stride=1)
 
-    def forward(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            z: [B, T, K=8, D=256] backbone output
-
+            x: [B, C, T, F'] encoded features
         Returns:
-            crm_real: [B, T, 257] real part of CRM
-            crm_imag: [B, T, 257] imaginary part of CRM
+            x: [B, C, T, F'] with TF-Mamba3 processing
         """
-        B, T, K, D = z.shape
+        b, c, t, f = x.size()
 
-        crm_real_parts = []
-        crm_imag_parts = []
+        # === Temporal Mamba3 ===
+        # Reshape: [B, C, T, F'] → [B*F', T, C]
+        x = x.permute(0, 3, 2, 1).contiguous().view(b * f, t, c)
+        # BiMamba3 → [B*F', T, 2C], project → [B*F', T, C], residual
+        x = self.tlinear(self.time_mamba(x).permute(0, 2, 1)).permute(0, 2, 1) + x
 
-        for band_idx in range(self.n_bands):
-            start, end = self.band_bins[band_idx]
-            n_bins = end - start
+        # === Frequency Mamba3 ===
+        # Reshape: [B*F', T, C] → [B, F', T, C] → [B, T, F', C] → [B*T, F', C]
+        x = x.view(b, f, t, c).permute(0, 2, 1, 3).contiguous().view(b * t, f, c)
+        # BiMamba3 → [B*T, F', 2C], project → [B*T, F', C], residual
+        x = self.flinear(self.freq_mamba(x).permute(0, 2, 1)).permute(0, 2, 1) + x
 
-            h = self.band_norms[band_idx](z[:, :, band_idx, :])   # [B, T, D]
-            mask = self.band_deprojections[band_idx](h)            # [B, T, 2*n_bins]
+        # Reshape back: [B*T, F', C] → [B, T, F', C] → [B, C, T, F']
+        x = x.view(b, t, f, c).permute(0, 3, 1, 2)
 
-            # Split into real and imag mask components
-            mask_real = mask[:, :, :n_bins]      # [B, T, n_bins]
-            mask_imag = mask[:, :, n_bins:]       # [B, T, n_bins]
+        return x
 
-            crm_real_parts.append(mask_real)
-            crm_imag_parts.append(mask_imag)
 
-        # Concatenate all bands → full spectrum CRM
-        crm_real = torch.cat(crm_real_parts, dim=-1)  # [B, T, 257]
-        crm_imag = torch.cat(crm_imag_parts, dim=-1)  # [B, T, 257]
+# ═══════════════════════════════════════════════════════════════════════════
+# DECODERS
+# ═══════════════════════════════════════════════════════════════════════════
 
-        # D8: tanh activation bounds CRM in [-1, 1]
-        crm_real = torch.tanh(crm_real)
-        crm_imag = torch.tanh(crm_imag)
+class MagDecoder(nn.Module):
+    """
+    Magnitude mask decoder with LearnableSigmoid activation.
+    
+    Output range: [0, beta=2.0] — can AMPLIFY weak speech components.
+    DenseBlock → ConvTranspose2d (upsample F'→F) → Conv2d → LearnableSigmoid2D
+    """
 
-        return crm_real, crm_imag
+    def __init__(self, hid_feature: int = 64, n_fft: int = 400, beta: float = 2.0):
+        super().__init__()
+        self.dense_block = DenseBlock(hid_feature, depth=4)
+        self.n_fft = n_fft
+
+        self.mask_conv = nn.Sequential(
+            nn.ConvTranspose2d(hid_feature, hid_feature, (1, 3), stride=(1, 2)),
+            nn.Conv2d(hid_feature, 1, (1, 1)),
+            nn.InstanceNorm2d(1, affine=True),
+            nn.PReLU(1),
+            nn.Conv2d(1, 1, (1, 1)),
+        )
+        self.lsigmoid = LearnableSigmoid2D(n_fft // 2 + 1, beta=beta)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [B, C, T, F'=100] encoder features
+        Returns:
+            mask: [B, 1, T, F=201] magnitude mask via LearnableSigmoid
+        """
+        x = self.dense_block(x)       # [B, C, T, F'=100]
+        x = self.mask_conv(x)          # [B, 1, T, F=201]
+        # Apply per-frequency learnable sigmoid
+        x = rearrange(x, 'b c t f -> b f t c').squeeze(-1)   # [B, F, T]
+        x = self.lsigmoid(x)                                  # [B, F, T]
+        x = rearrange(x, 'b f t -> b t f').unsqueeze(1)       # [B, 1, T, F]
+        return x
+
+
+class PhaseDecoder(nn.Module):
+    """
+    Phase prediction decoder via atan2(imag, real).
+    
+    Directly predicts clean phase without wrapping issues.
+    DenseBlock → ConvTranspose2d (upsample) → atan2
+    """
+
+    def __init__(self, hid_feature: int = 64):
+        super().__init__()
+        self.dense_block = DenseBlock(hid_feature, depth=4)
+
+        self.phase_conv = nn.Sequential(
+            nn.ConvTranspose2d(hid_feature, hid_feature, (1, 3), stride=(1, 2)),
+            nn.InstanceNorm2d(hid_feature, affine=True),
+            nn.PReLU(hid_feature),
+        )
+        self.phase_conv_r = nn.Conv2d(hid_feature, 1, (1, 1))
+        self.phase_conv_i = nn.Conv2d(hid_feature, 1, (1, 1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [B, C, T, F'=100] encoder features
+        Returns:
+            phase: [B, 1, T, F=201] predicted phase via atan2
+        """
+        x = self.dense_block(x)          # [B, C, T, F'=100]
+        x = self.phase_conv(x)           # [B, C, T, F=201]
+        x_r = self.phase_conv_r(x)       # [B, 1, T, F=201]
+        x_i = self.phase_conv_i(x)       # [B, 1, T, F=201]
+        phase = torch.atan2(x_i, x_r)   # [B, 1, T, F=201]
+        return phase
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -594,154 +391,100 @@ class BandMergeDecoder(nn.Module):
 
 class BSMamba3SE(nn.Module):
     """
-    Band-Split Mamba3 Speech Enhancement (BSMamba3-SE)
+    Band-Split Mamba3 Speech Enhancement.
 
-    Full pipeline:
-      [Noisy waveform] → MultiScaleSTFT → BandSplitEncoder
-      → N×BSMamba3Block → BandMergeDecoder → CRM × STFT → ISTFT
-      → [Enhanced waveform]
-
-    Key innovations (each validated in ablation study):
-      1. Complex-valued SSM states for harmonic tracking (Mamba3 Innovation 2)
-      2. MIMO rank-4 for cross-band coupling (Mamba3 Innovation 3)
-      3. Trapezoidal discretization replaces causal conv (Mamba3 Innovation 1)
-      4. Band-split processing with acoustically-motivated boundaries
-      5. InterBandAttention for generalization (MambAttention finding)
+    Pipeline:
+      1. Input: noisy_mag [B, F, T], noisy_pha [B, F, T] (pre-compressed)
+      2. Concat → [B, 2, T, F] → DenseEncoder → [B, C, T, F']
+      3. N × TFMamba3Block (bidirectional Mamba3 on time + freq axes)
+      4. MagDecoder → magnitude mask (LearnableSigmoid, range [0, 2.0])
+      5. PhaseDecoder → clean phase (atan2)
+      6. denoised_mag = mask × noisy_mag
+      7. denoised_com = mag * exp(j * phase)
+    
+    Output: denoised_mag, denoised_pha, denoised_com
     """
 
-    def __init__(
-        self,
-        d_model: int = 256,
-        d_state: int = 128,
-        headdim: int = 64,
-        mimo_rank: int = 4,
-        chunk_size: int = 16,
-        n_blocks: int = 6,
-        n_bands: int = 8,
-        attn_heads: int = 4,
-        attn_window: int = 4,
-        ffn_expansion: int = 4,
-        use_grad_checkpoint: bool = True,
-    ):
+    def __init__(self, cfg):
         super().__init__()
-        self.d_model = d_model
-        self.n_blocks = n_blocks
-        self.n_bands = n_bands
-        self.chunk_size = chunk_size
-        self.use_grad_checkpoint = use_grad_checkpoint
+        self.cfg = cfg
+        hid = cfg.hid_feature
+        num_blocks = cfg.num_tfmamba
 
-        # Stage 1: Multi-scale STFT
-        self.stft_encoder = MultiScaleSTFT()
-
-        # Stage 2: Band-split encoder
-        self.band_split_encoder = BandSplitEncoder(
-            d_model=d_model,
-            n_bands=n_bands,
+        # Encoder
+        self.dense_encoder = DenseEncoder(
+            in_channel=cfg.input_channel,
+            hid_feature=hid,
         )
 
-        # Stage 3: BSMamba3 backbone (N blocks)
-        self.backbone = nn.ModuleList([
-            BSMamba3Block(
-                d_model=d_model,
-                d_state=d_state,
-                headdim=headdim,
-                mimo_rank=mimo_rank,
-                chunk_size=chunk_size,
-                n_bands=n_bands,
-                attn_heads=attn_heads,
-                attn_window=attn_window,
-                ffn_expansion=ffn_expansion,
-                layer_idx=i,
+        # Backbone: N × TFMamba3 blocks
+        self.tf_blocks = nn.ModuleList([
+            TFMamba3Block(
+                hid_feature=hid,
+                d_state=cfg.d_state,
+                headdim=cfg.headdim,
+                mimo_rank=cfg.mimo_rank,
+                chunk_size=cfg.chunk_size,
             )
-            for i in range(n_blocks)
+            for _ in range(num_blocks)
         ])
 
-        # Stage 4: Band-merge decoder
-        self.band_merge_decoder = BandMergeDecoder(
-            d_model=d_model,
-            n_bands=n_bands,
+        # Decoders
+        self.mask_decoder = MagDecoder(
+            hid_feature=hid,
+            n_fft=cfg.n_fft,
+            beta=cfg.beta,
         )
+        self.phase_decoder = PhaseDecoder(hid_feature=hid)
 
-        # Initialize weights
-        self._init_weights()
-
-    def _init_weights(self):
-        """Xavier uniform for linear layers, skip Mamba3 (has its own init)."""
-        for name, module in self.named_modules():
-            if isinstance(module, nn.Linear) and 'mamba3' not in name:
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor], torch.Tensor]:
+    def forward(
+        self, noisy_mag: torch.Tensor, noisy_pha: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Full forward pass: waveform → waveform.
-
         Args:
-            x: [B, L] noisy waveform at 16kHz
+            noisy_mag: [B, F=201, T] compressed noisy magnitude
+            noisy_pha: [B, F=201, T] noisy phase
 
         Returns:
-            x_hat: [B, L] enhanced waveform
-            stfts: list of 3 complex spectrograms (for multi-scale loss)
-            enhanced_stft: [B, 257, T] enhanced complex STFT (for spectral losses)
+            denoised_mag: [B, F, T] enhanced compressed magnitude
+            denoised_pha: [B, F, T] predicted clean phase
+            denoised_com: [B, F, T, 2] complex representation (for complex loss)
         """
-        B, L = x.shape
+        # Reshape: [B, F, T] → [B, 1, T, F]
+        noisy_mag_in = rearrange(noisy_mag, 'b f t -> b t f').unsqueeze(1)
+        noisy_pha_in = rearrange(noisy_pha, 'b f t -> b t f').unsqueeze(1)
 
-        # Stage 1: Multi-scale STFT
-        stfts, primary_stft = self.stft_encoder(x)  # stfts: list of [B, F_k, T_k]
-        # primary_stft: [B, T, 257] complex
+        # Concat mag + phase → [B, 2, T, F]
+        x = torch.cat((noisy_mag_in, noisy_pha_in), dim=1)
 
-        # Store noisy STFT for CRM application
-        noisy_stft = primary_stft  # [B, T, 257]
+        # Encode
+        x = self.dense_encoder(x)  # [B, C, T, F'=100]
 
-        # Stage 2: Band-split encoder
-        z, _ = self.band_split_encoder(stfts, primary_stft)  # z: [B, T, K=8, D=256]
+        # Backbone: TFMamba3 blocks
+        for block in self.tf_blocks:
+            x = block(x)
 
-        # Mamba3 kernel requirement: sequence length T must be divisible by chunk_size
-        T_orig = z.shape[1]
-        pad_len = (self.chunk_size - T_orig % self.chunk_size) % self.chunk_size
-        if pad_len > 0:
-            # Pad along the T dimension (dim 1): F.pad reads from last dimension to first
-            # z is [B, T, K, D], so pad_T is the 5th and 6th arguments in pad: (D_l, D_r, K_l, K_r, T_l, T_r)
-            z = F.pad(z, (0, 0, 0, 0, 0, pad_len))
+        # Decode magnitude mask
+        # mask: [B, 1, T, F] → multiply with noisy_mag → denoised_mag
+        mask = self.mask_decoder(x)
+        denoised_mag = rearrange(
+            mask * noisy_mag_in, 'b c t f -> b f t c'
+        ).squeeze(-1)  # [B, F, T]
 
-        # Stage 3: BSMamba3 backbone with optional gradient checkpointing
-        for block in self.backbone:
-            if self.use_grad_checkpoint and self.training:
-                z = torch.utils.checkpoint.checkpoint(
-                    block, z, use_reentrant=True
-                )
-            else:
-                z = block(z)
-        # z: [B, T+pad, K, D]
+        # Decode phase
+        denoised_pha = rearrange(
+            self.phase_decoder(x), 'b c t f -> b f t c'
+        ).squeeze(-1)  # [B, F, T]
 
-        # Unpad to original length before CRM definition
-        if pad_len > 0:
-            z = z[:, :T_orig, :, :]
+        # Combine into complex representation
+        denoised_com = torch.stack(
+            (denoised_mag * torch.cos(denoised_pha),
+             denoised_mag * torch.sin(denoised_pha)),
+            dim=-1
+        )  # [B, F, T, 2]
 
-        # Stage 4: Band-merge decoder → CRM
-        crm_real, crm_imag = self.band_merge_decoder(z)  # [B, T, 257] each
-
-        # Stage 5: Apply CRM to noisy STFT (complex multiply)
-        # Ŝ = (M_r + j·M_i) × Y_complex
-        # PyTorch torch.complex doesn't support bfloat16, cast to float32
-        crm = torch.complex(crm_real.float(), crm_imag.float())  # [B, T, 257]
-        enhanced_stft = crm * noisy_stft                    # [B, T, 257]
-
-        # ISTFT to waveform
-        enhanced_stft_t = enhanced_stft.transpose(1, 2)     # [B, 257, T]
-        x_hat = self.stft_encoder.istft(enhanced_stft_t, length=L)  # [B, L]
-
-        return x_hat, stfts, enhanced_stft_t
+        return denoised_mag, denoised_pha, denoised_com
 
     def count_parameters(self) -> int:
-        """Returns total trainable parameter count."""
+        """Total trainable parameters."""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
-
-    def count_parameters_breakdown(self) -> Dict[str, int]:
-        """Returns parameter count per major component."""
-        breakdown = {}
-        for name, module in self.named_children():
-            count = sum(p.numel() for p in module.parameters() if p.requires_grad)
-            breakdown[name] = count
-        return breakdown
